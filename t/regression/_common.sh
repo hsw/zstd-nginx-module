@@ -146,6 +146,33 @@ assert_eq() {
     fi
 }
 
+# stop_local_nginx — graceful then forceful teardown of an in-container nginx.
+# Tries `nginx -s stop` (matches the config the test rendered), waits up to ~2s
+# for the master to release /tmp/nginx.pid, then escalates to SIGTERM via
+# pkill, then SIGKILL. Idempotent. Designed for in-container regression scripts
+# that re-render config and bring nginx up multiple times.
+stop_local_nginx() {
+    local conf="${1:-/etc/nginx/nginx.conf}"
+    nginx -c "$conf" -s stop >/dev/null 2>&1 || true
+    local i=0
+    while [ -f /tmp/nginx.pid ] && [ "$i" -lt 20 ]; do
+        sleep 0.1
+        i=$((i + 1))
+    done
+    # Forceful escalation if graceful stop didn't take effect (e.g. the
+    # invoked binary was launched with a different `-c` than we asked here).
+    if [ -f /tmp/nginx.pid ] || pgrep -x nginx >/dev/null 2>&1; then
+        pkill -TERM -x nginx >/dev/null 2>&1 || true
+        i=0
+        while pgrep -x nginx >/dev/null 2>&1 && [ "$i" -lt 30 ]; do
+            sleep 0.1
+            i=$((i + 1))
+        done
+        pkill -KILL -x nginx >/dev/null 2>&1 || true
+    fi
+    rm -f /tmp/nginx.pid
+}
+
 # _log_pass <label> — pretty-prints a green-ish PASS line so regression scripts
 # share a uniform output format. No exit semantics; pure logging.
 _log_pass() {

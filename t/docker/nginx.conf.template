@@ -38,6 +38,14 @@ http {
     zstd_min_length 0;
     zstd_types *;
 
+    # gzip_vary controls whether nginx core's header filter emits
+    # `Vary: Accept-Encoding` when a compression filter sets r->gzip_vary. The
+    # zstd filter sets r->gzip_vary=1 unconditionally, but this directive must
+    # also be `on` for the Vary header to materialise (nginx default is off).
+    # Every realistic production zstd config flips this on; the head-parity
+    # regression depends on it.
+    gzip_vary on;
+
     __EXTRA_DIRECTIVES__
 
     server {
