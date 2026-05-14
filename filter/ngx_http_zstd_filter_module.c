@@ -199,6 +199,15 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
+    /*
+     * 2026-05-14: r->header_only is intentionally NOT in this rejection
+     * block. HEAD requests need the same Content-Encoding / Vary /
+     * cleared-Content-Length headers as GET so client tooling that
+     * probes via HEAD before deciding to download sees the correct
+     * encoding. The r->header_only short-circuit happens further down,
+     * AFTER header mutations but BEFORE ctx allocation / CStream init
+     * — see comment near the short-circuit below.
+     */
     if (!zlcf->enable
         || (r->headers_out.status != NGX_HTTP_OK
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
@@ -207,8 +216,7 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
            && r->headers_out.content_encoding->value.len)
        || (r->headers_out.content_length_n != -1
            && r->headers_out.content_length_n < zlcf->min_length)
-       || ngx_http_test_content_type(r, &zlcf->types) == NULL
-       || r->header_only)
+       || ngx_http_test_content_type(r, &zlcf->types) == NULL)
     {
         return ngx_http_next_header_filter(r);
     }
@@ -216,6 +224,40 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     r->gzip_vary = 1;
 
     if (ngx_http_zstd_ok(r) != NGX_OK) {
+        return ngx_http_next_header_filter(r);
+    }
+
+    /*
+     * Apply header mutations BEFORE the r->header_only short-circuit so
+     * that HEAD responses carry Content-Encoding: zstd, cleared
+     * Content-Length, cleared Accept-Ranges, weak ETag, and
+     * Vary: Accept-Encoding (via r->gzip_vary above) — matching what a
+     * GET response would carry. No ctx / CStream allocations have
+     * happened yet at this point, so the HEAD return path below leaks
+     * nothing.
+     */
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    ngx_str_set(&h->key, "Content-Encoding");
+    ngx_str_set(&h->value, "zstd");
+    r->headers_out.content_encoding = h;
+
+    ngx_http_clear_content_length(r);
+    ngx_http_clear_accept_ranges(r);
+    ngx_http_weak_etag(r);
+
+    if (r->header_only) {
+        /*
+         * HEAD request: headers are now set for parity with GET, but
+         * skip ctx / CStream allocation — there's no body to compress.
+         * The body filter is a no-op when ctx is NULL (see
+         * ngx_http_zstd_body_filter early return on ctx == NULL).
+         */
         return ngx_http_next_header_filter(r);
     }
 
@@ -229,21 +271,7 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     ctx->request = r;
     ctx->last_out = &ctx->out;
 
-    h = ngx_list_push(&r->headers_out.headers);
-    if (h == NULL) {
-        return NGX_ERROR;
-    }
-
-    h->hash = 1;
-    ngx_str_set(&h->key, "Content-Encoding");
-    ngx_str_set(&h->value, "zstd");
-    r->headers_out.content_encoding = h;
-
     r->main_filter_need_in_memory = 1;
-
-    ngx_http_clear_content_length(r);
-    ngx_http_clear_accept_ranges(r);
-    ngx_http_weak_etag(r);
 
     return ngx_http_next_header_filter(r);
 }
