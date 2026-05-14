@@ -298,9 +298,7 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    if (ngx_memcmp(ae->value.data, "zstd", 4) != 0
-        && ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK)
-    {
+    if (ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK) {
         return NGX_DECLINED;
     }
 
@@ -315,20 +313,41 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_zstd_accept_encoding(ngx_str_t *ae)
 {
-    u_char  *p;
+    u_char  *p, *end;
 
-    p = ngx_strcasestrn(ae->data, "zstd", sizeof("zstd") - 1);
-    if (p == NULL) {
-        return NGX_DECLINED;
-    }
+    /*
+     * Bounded stop-char check: locate a case-insensitive "zstd" token whose
+     * neighbours are token separators (comma, semicolon, whitespace) or
+     * string boundaries. This rejects "zstdx", "zstd-future", "xzstd", etc.
+     * RFC 9110 q-value handling is deferred to the filter parser rewrite;
+     * this static-module check intentionally mirrors the conservative
+     * upstream semantics but with correct boundary handling.
+     */
 
-    if (p == ae->data || (*(p - 1) == ',' || *(p - 1) == ' ')) {
+    end = ae->data + ae->len;
+    p = ae->data;
+
+    while (p < end) {
+        p = ngx_strcasestrn(p, "zstd", sizeof("zstd") - 1 - 1);
+        if (p == NULL) {
+            return NGX_DECLINED;
+        }
+
+        if (p == ae->data
+            || *(p - 1) == ',' || *(p - 1) == ';'
+            || *(p - 1) == ' ' || *(p - 1) == '\t')
+        {
+            u_char  *q = p + (sizeof("zstd") - 1);
+
+            if (q == end
+                || *q == ',' || *q == ';'
+                || *q == ' ' || *q == '\t')
+            {
+                return NGX_OK;
+            }
+        }
 
         p += sizeof("zstd") - 1;
-
-        if (p == ae->data + ae->len || *p == ',' || *p == ' ' || *p == ';') {
-            return NGX_OK;
-        }
     }
 
     return NGX_DECLINED;

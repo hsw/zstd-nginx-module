@@ -363,7 +363,7 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             if (ZSTD_isError(rv)) {
                 ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
                               "ZSTD_freeCStream() failed: %s",
-                              ZSTD_getErrorName(rc));
+                              ZSTD_getErrorName(rv));
 
                 rc = NGX_ERROR;
             }
@@ -977,11 +977,23 @@ static char *
 ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data)
 {
     ngx_int_t  *np = data;
+    ngx_int_t   min_level;
 
-    if (*np == 0 || *np < (ngx_int_t)ZSTD_minCLevel() || *np > ZSTD_maxCLevel()) {
+#if ZSTD_VERSION_NUMBER >= 10306
+    min_level = (ngx_int_t) ZSTD_minCLevel();
+#else
+    /*
+     * ZSTD_minCLevel() was introduced in libzstd 1.3.6; fall back to the
+     * documented minimum compression level (1) for older versions so we
+     * still build and accept all valid levels on legacy distros.
+     */
+    min_level = 1;
+#endif
+
+    if (*np == 0 || *np < min_level || *np > ZSTD_maxCLevel()) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "zstd compress level must between %i and %i excluding 0",
-                           (ngx_int_t)ZSTD_minCLevel(), ZSTD_maxCLevel());
+                           min_level, ZSTD_maxCLevel());
 
         return NGX_CONF_ERROR;
     }
@@ -1008,11 +1020,13 @@ ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, vo
     value = cf->args->elts;
 
     if (*(value[1].data) == '-') {
-        // Parse ignoring the leading '-' character
+        /* Parse ignoring the leading '-' character */
         *np = ngx_atoi(value[1].data + 1, value[1].len - 1);
 
-        // NGX_ERROR is -1 so we need to check for that before making the parsed
-        // result negative
+        /*
+         * NGX_ERROR is -1 so we need to check for that before making the
+         * parsed result negative
+         */
         if (*np == NGX_ERROR) {
             return "invalid number";
         }
