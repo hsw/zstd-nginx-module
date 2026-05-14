@@ -1,0 +1,70 @@
+# Dockerfile.ubuntu-22.04 — dynamic-module build against nginx.org mainline.
+#
+# Build context expected to be the repo root (see t/build.sh).
+# nginx is installed from the official nginx.org mainline apt repo
+# (https://nginx.org/en/linux_packages.html) so we test against a known
+# upstream version rather than Ubuntu's distro patchset. The matching source
+# tarball is downloaded from https://nginx.org/download/ to compile the module
+# .so against ABI-identical headers.
+
+FROM ubuntu:22.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates gnupg lsb-release \
+        build-essential libpcre3-dev libssl-dev zlib1g-dev \
+        libzstd-dev wget pkg-config
+
+# nginx.org mainline apt repo. The signing key and apt pin keep us strictly on
+# nginx.org packages even if a distro nginx-* package would otherwise win on
+# version-compare.
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update \
+ && apt-get install -y nginx
+
+# Match nginx source to installed mainline version. nginx -v prints to stderr
+# in the form "nginx version: nginx/1.27.3" — we strip everything around the
+# version triplet and fetch the matching tarball from nginx.org.
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx
+
+COPY . /src/
+RUN /src/t/docker/build-module.sh /usr/local/src/nginx /src dynamic
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+        curl ca-certificates gnupg lsb-release zstd libzstd1 python3 \
+ && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && apt-get update && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/src/nginx/objs/*.so /etc/nginx/modules/
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+# Render a default nginx.conf so the baseline `CMD ["nginx"]`
+# works without an external entrypoint. Regression scripts re-render the
+# template against /etc/nginx/templates/nginx.conf.template at test time.
+RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi \
+ && sed \
+        -e 's|__LOAD_MODULES__|load_module modules/ngx_http_zstd_filter_module.so;|' \
+        -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+CMD ["nginx"]

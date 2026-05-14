@@ -1,0 +1,68 @@
+# Dockerfile.ubuntu-24.04-shared-only — identical to ubuntu-24.04 but the
+# build stage deletes every libzstd.a* archive after installing libzstd-dev.
+# This proves Task 2's dynamic-first detection works: configure must succeed
+# even when only the shared library is on disk, which is the realistic case
+# for distro packages that ship libzstd.so without the static archive.
+
+FROM ubuntu:24.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates gnupg lsb-release \
+        build-essential libpcre3-dev libssl-dev zlib1g-dev \
+        libzstd-dev wget pkg-config
+
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update \
+ && apt-get install -y nginx
+
+# Remove static archives to prove dynamic-first detection (Task 2). We
+# can't use `find / -prune -o -delete` because `-delete` forces `-depth`,
+# which makes `-prune` a no-op (GNU find emits a warning then bails out
+# without deleting anything). Instead, delete from the actual lib dirs and
+# verify nothing matches afterwards.
+RUN rm -f /usr/lib/x86_64-linux-gnu/libzstd.a* /usr/lib/libzstd.a* \
+ && if ls /usr/lib/x86_64-linux-gnu/libzstd.a* /usr/lib/libzstd.a* 2>/dev/null; then \
+        echo "shared-only fixture: libzstd.a survived deletion" >&2; exit 1; \
+    fi
+
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx
+
+COPY . /src/
+RUN /src/t/docker/build-module.sh /usr/local/src/nginx /src dynamic
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+        curl ca-certificates gnupg lsb-release zstd libzstd1 python3 \
+ && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && apt-get update && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/src/nginx/objs/*.so /etc/nginx/modules/
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi \
+ && sed \
+        -e 's|__LOAD_MODULES__|load_module modules/ngx_http_zstd_filter_module.so;|' \
+        -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+CMD ["nginx"]

@@ -1,0 +1,88 @@
+# Dockerfile.ubuntu-24.04-brotli — STATIC build that links ngx_brotli and
+# this module into a fresh nginx binary. Exercises Task 8's filter-priority
+# sed (brotli > zstd > gzip ordering in HTTP_FILTER_MODULES) and the
+# precedence regression in t/regression/filter-priority.sh.
+#
+# Even though this image's runtime nginx is a static build, we still install
+# nginx from the nginx.org mainline apt repo in the build stage — that lets us
+# discover the canonical upstream version and download the matching source
+# tarball, keeping the brotli variant on the same nginx tree as the dynamic
+# variants. The runtime stage replaces the apt-installed /usr/sbin/nginx with
+# our statically linked binary.
+
+FROM ubuntu:24.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates gnupg lsb-release \
+        build-essential libpcre3-dev libssl-dev zlib1g-dev \
+        libzstd-dev libbrotli-dev \
+        wget pkg-config git cmake g++
+
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update \
+ && apt-get install -y nginx
+
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx
+
+# Pin ngx_brotli to a ref for reproducibility (default master; override at
+# build time with --build-arg NGX_BROTLI_REF=...). The submodules pull in the
+# google/brotli C library sources used by the encoder.
+ARG NGX_BROTLI_REF=master
+RUN git clone --recurse-submodules --depth 1 --branch "${NGX_BROTLI_REF}" \
+        https://github.com/google/ngx_brotli.git /src/ngx_brotli
+
+COPY . /src/zstd-nginx-module/
+# Static build links brotli + zstd into a single nginx binary. The third
+# positional arg "static" selects --add-module + `make` (no --with-compat).
+RUN /src/zstd-nginx-module/t/docker/build-module.sh \
+        /usr/local/src/nginx \
+        /src/zstd-nginx-module \
+        static \
+        /src/ngx_brotli
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Runtime deps: libpcre3/zlib/libssl for the freshly built nginx binary, plus
+# the libbrotli runtime libs that the static brotli filter dlopens (encoder/
+# common shared libs are loaded at runtime even from a static build).
+RUN apt-get update && apt-get install -y \
+        libzstd1 libpcre3 zlib1g libssl3 libbrotli1 \
+        curl zstd python3 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Drop the static nginx binary at the standard path and recreate the dirs the
+# config expects.
+COPY --from=build /usr/local/src/nginx/objs/nginx /usr/sbin/nginx
+RUN mkdir -p /etc/nginx /etc/nginx/modules /var/log/nginx /var/cache/nginx \
+             /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi
+
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+# Static build: no `load_module` lines. Brotli is enabled inline so the
+# default config is meaningful even before regression-specific re-rendering.
+RUN sed \
+        -e 's|__LOAD_MODULES__||' \
+        -e 's|__EXTRA_DIRECTIVES__|brotli on; brotli_min_length 0; brotli_types *;|' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+# Static-build nginx was configured with the default prefix /usr/local/nginx,
+# so it looks for conf at /usr/local/nginx/conf/nginx.conf by default. We
+# point it explicitly at the rendered /etc/nginx config to match the runtime
+# layout of the other variants.
+CMD ["nginx", "-c", "/etc/nginx/nginx.conf"]

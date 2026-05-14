@@ -1,0 +1,8 @@
+# Keep the docker build context tight. Without this, `COPY . /src/` slurps in
+# the developer's local mac nginx tree under tmp/, the .git history, plan
+# scratch, and the Claude harness state — multi-hundred-megabyte context
+# transfers and bogus cache invalidations.
+.git
+.claude
+tmp
+docs

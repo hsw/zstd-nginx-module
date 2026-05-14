@@ -1,0 +1,85 @@
+# nginx.conf.template — rendered at container start (or test time) by
+# substituting the __MARKER__ tokens via `sed`. Markers:
+#
+#   __LOAD_MODULES__       lines emitting `load_module ...;` for dynamic builds,
+#                          or a blank line for static builds.
+#   __EXTRA_DIRECTIVES__   regression-test-specific http-context directives
+#                          (e.g. zstd_window_bits, zstd_bypass) injected per script.
+#   __EXTRA_LOCATIONS__    extra server-context location blocks for regression
+#                          fixtures that need bespoke handlers (default: empty).
+#   __SERVER_PORT__        listen port for the test server (default 8080).
+#
+# Defaults below are tuned to make compression observable on every response:
+#   zstd on;  zstd_min_length 0;  zstd_types *;
+
+daemon off;
+error_log /dev/stderr info;
+pid /tmp/nginx.pid;
+
+# load_module must appear in the main context BEFORE `events {}` per nginx
+# core (otherwise: "load_module directive is specified too late").
+__LOAD_MODULES__
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    access_log off;
+    default_type application/octet-stream;
+
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path       /tmp/proxy;
+    fastcgi_temp_path     /tmp/fastcgi;
+    uwsgi_temp_path       /tmp/uwsgi;
+    scgi_temp_path        /tmp/scgi;
+
+    zstd on;
+    zstd_min_length 0;
+    zstd_types *;
+
+    __EXTRA_DIRECTIVES__
+
+    server {
+        listen __SERVER_PORT__;
+        server_name _;
+
+        # Baseline liveness probe — used by t/run.sh baseline.
+        location = / {
+            add_header Content-Type text/plain;
+            return 200 "ok\n";
+        }
+
+        # Static-text fixture for compressibility checks. Body is highly
+        # repetitive so zstd output is always smaller than input.
+        location = /text {
+            add_header Content-Type text/plain;
+            return 200 "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.\n";
+        }
+
+        # Synthetic body served from a file written by the entrypoint. Tests
+        # that need deterministic large payloads (h2-truncation 131072 etc.)
+        # generate the file via the python fixture server before starting nginx.
+        location /random/ {
+            alias /var/fixtures/random/;
+            default_type application/octet-stream;
+        }
+
+        # Marker for zstd_bypass regression — clients set ?bypass=1 to flip the
+        # predicate. zstd_bypass is configured per-test via __EXTRA_DIRECTIVES__.
+        location = /bypass-marker {
+            add_header Content-Type text/plain;
+            return 200 "bypass-payload-bypass-payload-bypass-payload-bypass-payload\n";
+        }
+
+        # Reverse-proxy hook for the python fixture server (origin emulation).
+        # The fixture server listens on 127.0.0.1:9000 inside the container.
+        location /origin/ {
+            proxy_pass http://127.0.0.1:9000/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+        }
+
+        __EXTRA_LOCATIONS__
+    }
+}
