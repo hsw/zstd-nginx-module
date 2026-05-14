@@ -51,8 +51,12 @@ END
 else
     # auto-discovery: prefer shared libzstd (required for --add-dynamic-module;
     # static linking of libzstd.a into a .so typically fails without -fPIC archives).
+    # ZSTD_STATIC_LINKING_ONLY is purely a header visibility gate (not a link
+    # mode) — needed because this module uses ZSTD_createCStream_advanced /
+    # ZSTD_createCDict_byReference / ZSTD_customMem which live in the
+    # experimental section of zstd.h.
     ngx_feature="ZStandard dynamic library"
-    ngx_zstd_opt_I=
+    ngx_zstd_opt_I="-DZSTD_STATIC_LINKING_ONLY"
     ngx_zstd_opt_L="-lzstd"
 
     SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
@@ -70,7 +74,7 @@ else
         # fall back to static archive only for static (--add-module) builds;
         # dynamic modules must link the shared library.
         ngx_feature="ZStandard static library"
-        ngx_zstd_opt_I=
+        ngx_zstd_opt_I="-DZSTD_STATIC_LINKING_ONLY"
         ngx_zstd_opt_L="-l:libzstd.a"
 
         SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
