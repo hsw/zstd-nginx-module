@@ -49,12 +49,16 @@ END
 
     fi
 else
-    # auto-discovery
-    ngx_feature="ZStandard static library"
+    # auto-discovery: prefer shared libzstd (required for --add-dynamic-module;
+    # static linking of libzstd.a into a .so typically fails without -fPIC archives).
+    # ZSTD_STATIC_LINKING_ONLY is purely a header visibility gate (not a link
+    # mode) — needed because this module uses ZSTD_createCStream_advanced /
+    # ZSTD_createCDict_byReference / ZSTD_customMem which live in the
+    # experimental section of zstd.h.
+    ngx_feature="ZStandard dynamic library"
     ngx_zstd_opt_I="-DZSTD_STATIC_LINKING_ONLY"
-    ngx_zstd_opt_L="-l:libzstd.a"
+    ngx_zstd_opt_L="-lzstd"
 
-    # still we consider the static library firstly
     SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
     CC_TEST_FLAGS="$ngx_zstd_opt_I $CC_TEST_FLAGS"
     SAVED_NGX_TEST_LD_OPT=$NGX_TEST_LD_OPT
@@ -66,10 +70,13 @@ else
     CC_TEST_FLAGS=$SAVED_CC_TAST_FLAGS
     NGX_TEST_LD_OPT=$SAVED_NGX_TEST_LD_OPT
 
-    if [ $ngx_found = no ]; then
+    if [ $ngx_found = no -a "$ngx_module_link" != DYNAMIC ]; then
+        # fall back to static archive only for static (--add-module) builds;
+        # dynamic modules must link the shared library.
+        ngx_feature="ZStandard static library"
+        ngx_zstd_opt_I="-DZSTD_STATIC_LINKING_ONLY"
+        ngx_zstd_opt_L="-l:libzstd.a"
 
-        ngx_feature="ZStandard dynamic library"
-        ngx_zstd_opt_L="-lzstd"
         SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
         CC_TEST_FLAGS="$ngx_zstd_opt_I $CC_TEST_FLAGS"
         SAVED_NGX_TEST_LD_OPT=$NGX_TEST_LD_OPT
@@ -77,20 +84,16 @@ else
 
         . auto/feature
 
-        if [ $ngx_found = no ]; then
-            cat << END
-            $0: error: ngx_http_zstd_filter_module requires the ZStandard library.
-END
-            exit 1
-        fi
-
         # restore
         CC_TEST_FLAGS=$SAVED_CC_TAST_FLAGS
         NGX_TEST_LD_OPT=$SAVED_NGX_TEST_LD_OPT
+    fi
 
+    if [ $ngx_found = no ]; then
         cat << END
-        $0: warning: ngx_http_zstd_filter_module uses advanced ZStandard APIs (which are still considered experimental) while you are trying to link the dynamic shared library.
+        $0: error: ngx_http_zstd_filter_module requires the ZStandard library.
 END
+        exit 1
     fi
 
     # TODO we need more tries for the different OS port.
