@@ -64,13 +64,21 @@ start_local_nginx
 PASS=0
 FAIL=0
 
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"; cleanup' EXIT
+
 URL="http://127.0.0.1:8080/text"
 
 # 1. HEAD request: must include Content-Encoding: zstd, Vary: Accept-Encoding,
 #    and MUST NOT include Content-Length (the encoded length is unknown at
 #    header time when compression streams). nginx switches to chunked
 #    (HTTP/1.1) instead.
-HEAD_HEADERS="$(curl -sSI -H "Accept-Encoding: zstd" "$URL")"
+#    `-X HEAD` (not `-I`) so curl writes only the body bytes to -o; with `-I`
+#    curl mirrors response headers into the body stream, which would defeat
+#    the HEAD body-empty assertion below.
+curl -sS -X HEAD -D "${TMPDIR}/head.hdr" -o "${TMPDIR}/head.body" \
+    -H "Accept-Encoding: zstd" "$URL"
+HEAD_HEADERS="$(cat "${TMPDIR}/head.hdr")"
 
 if assert_header "$HEAD_HEADERS" "Content-Encoding" "zstd" 2>/dev/null; then
     _log_pass "${LABEL}/head-content-encoding"; PASS=$((PASS + 1))
@@ -96,9 +104,19 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# HEAD response MUST NOT have a body — RFC 9110 §9.3.2 forbids it regardless
+# of the response framing. With chunked transfer-encoding, an over-zealous
+# body filter could emit a single empty terminating chunk (5 bytes: "0\r\n\r\n").
+# curl writes the body bytes to -o, so a non-zero file size signals a bug.
+HEAD_BODY_SIZE="$(wc -c < "${TMPDIR}/head.body" | tr -d ' ')"
+if [ "$HEAD_BODY_SIZE" -eq 0 ]; then
+    _log_pass "${LABEL}/head-empty-body"; PASS=$((PASS + 1))
+else
+    _log_fail "${LABEL}/head-empty-body" "HEAD body is ${HEAD_BODY_SIZE} bytes, expected 0"
+    FAIL=$((FAIL + 1))
+fi
+
 # 2. GET request: same three header invariants plus the body must decompress.
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"; cleanup' EXIT
 
 curl -sS -D "${TMPDIR}/get.hdr" -o "${TMPDIR}/get.body" \
     -H "Accept-Encoding: zstd" "$URL"
@@ -135,6 +153,37 @@ if zstd -dc -- "${TMPDIR}/get.body" > "${TMPDIR}/get.dec" 2>/dev/null; then
     fi
 else
     _log_fail "${LABEL}/get-decompresses" "zstd -d failed"
+    FAIL=$((FAIL + 1))
+fi
+
+# 3. ETag parity. Synthetic `return 200 "..."` locations don't emit ETag, so
+#    use a file-served fixture (nginx core stamps weak ETag from file mtime+size).
+#    HEAD and GET must both carry the same ETag value — zstd's header filter
+#    weakens strong ETags by prepending W/, applied identically on HEAD and GET.
+mkdir -p /var/fixtures/random
+ETAG_FIXTURE=/var/fixtures/random/etag-fixture
+if [ ! -s "$ETAG_FIXTURE" ]; then
+    dd if=/dev/zero bs=2048 count=1 status=none | tr '\0' 'Z' > "$ETAG_FIXTURE"
+fi
+
+ETAG_URL="http://127.0.0.1:8080/random/etag-fixture"
+curl -sS -I -D "${TMPDIR}/etag-head.hdr" -o /dev/null \
+    -H "Accept-Encoding: zstd" "$ETAG_URL"
+curl -sS -D "${TMPDIR}/etag-get.hdr" -o "${TMPDIR}/etag-get.body" \
+    -H "Accept-Encoding: zstd" "$ETAG_URL"
+
+extract_etag() {
+    tr -d '\r' < "$1" \
+        | awk -F': ' 'tolower($1)=="etag" {sub(/^[^:]*: */,""); print; exit}'
+}
+HEAD_ETAG="$(extract_etag "${TMPDIR}/etag-head.hdr")"
+GET_ETAG="$(extract_etag "${TMPDIR}/etag-get.hdr")"
+
+if [ -n "$HEAD_ETAG" ] && [ -n "$GET_ETAG" ] && [ "$HEAD_ETAG" = "$GET_ETAG" ]; then
+    _log_pass "${LABEL}/etag-match (${HEAD_ETAG})"; PASS=$((PASS + 1))
+else
+    _log_fail "${LABEL}/etag-match" \
+        "HEAD ETag=[${HEAD_ETAG}] GET ETag=[${GET_ETAG}] (must be equal and non-empty)"
     FAIL=$((FAIL + 1))
 fi
 

@@ -121,5 +121,13 @@ case_zstd_absent "false-prefix" "zstdx"
 case_zstd_present "case-insens" "ZSTD"
 case_zstd_present "q-wins"      "br;q=0.5, zstd;q=1"
 
+# Wildcard `*` is the common RFC 9110 escape hatch some HTTP clients send
+# instead of an explicit encoding list. Our parser is token-explicit (only
+# matches a literal "zstd" substring with valid token boundaries) — so `*`
+# alone MUST NOT trigger zstd compression. Asserting the conservative
+# behaviour mirrors nginx-core gzip, which also requires a literal "gzip"
+# token. Clients that want zstd via wildcard must add an explicit token.
+case_zstd_absent "wildcard-only" "*"
+
 echo "${LABEL}: pass=${PASS} fail=${FAIL}"
 [ "$FAIL" -eq 0 ]

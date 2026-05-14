@@ -52,3 +52,8 @@ Mkfile.old
 dkms.conf
 
 t/servroot/*
+
+# fork-development workspace (gitignored, see CHANGELOG attribution)
+.claude/
+tmp/
+docs/

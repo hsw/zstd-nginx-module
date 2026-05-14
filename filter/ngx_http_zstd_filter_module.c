@@ -503,6 +503,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     char         *hint;
     ngx_chain_t  *cl;
     ngx_buf_t    *b;
+    ngx_uint_t    last_action;
 
     ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "zstd compress in: src:%p pos:%ud size: %ud, "
@@ -551,7 +552,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
     ctx->redo = 0;
 
-    unsigned last_action = ctx->action;
+    last_action = ctx->action;
 
     if (rc > 0) {
         if (ctx->action == NGX_HTTP_ZSTD_FILTER_COMPRESS) {
@@ -601,10 +602,18 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 
     b = ctx->out_buf;
     if (ngx_buf_size(b) == 0) {
+        /*
+         * Sentinel buf emitted only to carry last_buf=1 / flush flags when
+         * the compressor produced no output this cycle. Tag it with the
+         * module address so ngx_chain_update_chains recognises it as ours
+         * and recycles it via ctx->free instead of accounting it against
+         * zlcf->bufs.num.
+         */
         b = ngx_calloc_buf(ctx->request->pool);
         if (b == NULL) {
             return NGX_ERROR;
         }
+        b->tag = (ngx_buf_tag_t) &ngx_http_zstd_filter_module;
     }
 
     /*
@@ -792,39 +801,30 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
 
             goto failed;
         }
-    }
 
 #if ZSTD_VERSION_NUMBER >= 10400
-    /*
-     * 2026-05-15: zstd_window_bits override. ZSTD_c_windowLog (the
-     * advanced-API parameter that ZSTD_CCtx_setParameter takes) was
-     * introduced in libzstd 1.4.0 as part of the stabilised advanced
-     * compression API — see lib/zstd.h "ZSTD_cParameter" enum, marked
-     * stable from 1.4.0. On libzstd 1.3.x the directive parses (range
-     * check still fires at config time via ngx_conf_check_num_bounds)
-     * but is silently a no-op at request time. Plan recommended YAGNI
-     * on a compile-time #warning — operators on legacy distros either
-     * read the docs or notice no change in compressed size; the
-     * fallback is benign.
-     *
-     * Range 10..27 is the libzstd-documented ZSTD_WINDOWLOG_MIN..MAX.
-     * windowLog=27 → 128 MiB window — memory cost lives on the CStream
-     * which we already pool-allocate per request, so the per-request
-     * cost is bounded by libzstd's internal cap.
-     */
-    if (zlcf->window_bits != NGX_CONF_UNSET) {
-        rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_windowLog,
-                                    (int) zlcf->window_bits);
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_CCtx_setParameter(ZSTD_c_windowLog, %i) "
-                          "failed: %s",
-                          zlcf->window_bits, ZSTD_getErrorName(rc));
+        /*
+         * zstd_window_bits: ZSTD_c_windowLog is stable from libzstd 1.4.0.
+         * Scoped to the non-dict path because the legacy dict initialiser
+         * ZSTD_initCStream_usingCDict (used on libzstd <1.5) does not honour
+         * a later ZSTD_CCtx_setParameter call. Range 10..27 is the
+         * libzstd-documented ZSTD_WINDOWLOG_MIN..MAX; on libzstd <1.4 the
+         * directive parses but is a silent runtime no-op.
+         */
+        if (zlcf->window_bits != NGX_CONF_UNSET) {
+            rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_windowLog,
+                                        (int) zlcf->window_bits);
+            if (ZSTD_isError(rc)) {
+                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                              "ZSTD_CCtx_setParameter(ZSTD_c_windowLog, %i) "
+                              "failed: %s",
+                              zlcf->window_bits, ZSTD_getErrorName(rc));
 
-            goto failed;
+                goto failed;
+            }
         }
-    }
 #endif
+    }
 
     return cstream;
 

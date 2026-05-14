@@ -25,6 +25,8 @@ source "${SCRIPT_DIR}/_common.sh"
 LABEL="infinite-loop"
 TMPDIR="$(mktemp -d)"
 FIXTURE_PID=""
+PASS=0
+FAIL=0
 
 cleanup() {
     if [ -n "$FIXTURE_PID" ]; then
@@ -43,6 +45,16 @@ render_conf() {
         -e 's|__EXTRA_LOCATIONS__||' \
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+    # Disable proxy_buffering on /origin/ so the upstream short-read flows
+    # straight through the zstd body filter — the original infinite-loop path.
+    # With default proxy_buffering on, nginx core may swallow the short-read
+    # at the upstream layer and emit 502 before the body filter ever runs;
+    # the test would then pass even with PR #23 reverted. The body size is
+    # set generously above proxy_buffer_size (default 4-8k) so any pre-filter
+    # buffering layer cannot absorb the entire stream before the body filter
+    # is invoked.
+    sed -i 's|proxy_pass http://127.0.0.1:9000/;|proxy_pass http://127.0.0.1:9000/; proxy_buffering off;|' /etc/nginx/nginx.conf
 
     if ! nginx -V 2>&1 | grep -q -- '--with-compat'; then
         sed -i '/^load_module /d' /etc/nginx/nginx.conf
@@ -86,14 +98,18 @@ def handle(c):
             if not chunk:
                 break
             buf += chunk
-        # Reply with Content-Length: 2 but send only "a" and close — short read.
+        # Reply with Content-Length one byte larger than the actual body and
+        # close the socket — short read by exactly one byte. Body is sized
+        # above proxy_buffer_size (default 4-8 KiB) so the body filter
+        # definitely runs against partial data before the upstream eofs.
+        body = b"x" * 16384
         c.sendall(
             b"HTTP/1.1 200 OK\r\n"
             b"Content-Type: text/plain\r\n"
-            b"Content-Length: 2\r\n"
+            b"Content-Length: " + str(len(body) + 1).encode() + b"\r\n"
             b"Connection: close\r\n"
             b"\r\n"
-            b"a"
+            + body
         )
     finally:
         try: c.shutdown(socket.SHUT_RDWR)
@@ -173,9 +189,11 @@ ELAPSED=$(( $(date +%s) - START_TS ))
 
 if [ "$ELAPSED" -ge 8 ]; then
     _log_fail "${LABEL}/no-hang" "curl took ${ELAPSED}s (must be <8s)"
+    FAIL=$((FAIL + 1))
     exit 1
 fi
 _log_pass "${LABEL}/no-hang (code=${HTTP_CODE}, elapsed=${ELAPSED}s)"
+PASS=$((PASS + 1))
 
 # Now sample worker CPU over 2 seconds. The fix means the worker drops back to
 # idle as soon as the upstream closes; the bug means it spins. Threshold is in
@@ -193,8 +211,11 @@ DELTA_MS=$(( DELTA * 1000 / CLK_TCK ))
 if [ "$DELTA_MS" -gt 200 ]; then
     _log_fail "${LABEL}/no-spin" \
         "worker CPU delta ${DELTA_MS}ms over 2s (must be <=200ms)"
+    FAIL=$((FAIL + 1))
     exit 1
 fi
 _log_pass "${LABEL}/no-spin (delta=${DELTA_MS}ms over 2s)"
+PASS=$((PASS + 1))
 
-echo "${LABEL}: pass=2 fail=0"
+echo "${LABEL}: pass=${PASS} fail=${FAIL}"
+[ "$FAIL" -eq 0 ]
