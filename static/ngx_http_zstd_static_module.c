@@ -319,9 +319,17 @@ ngx_http_zstd_accept_encoding(ngx_str_t *ae)
      * Bounded stop-char check: locate a case-insensitive "zstd" token whose
      * neighbours are token separators (comma, semicolon, whitespace) or
      * string boundaries. This rejects "zstdx", "zstd-future", "xzstd", etc.
-     * RFC 9110 q-value handling is deferred to the filter parser rewrite;
-     * this static-module check intentionally mirrors the conservative
-     * upstream semantics but with correct boundary handling.
+     *
+     * DIVERGENCE FROM FILTER PARSER (intentional, V1): the filter module's
+     * ngx_http_zstd_accept_encoding() (filter/ngx_http_zstd_filter_module.c,
+     * Task 5) additionally honours `;q=0` as an explicit reject per RFC 9110.
+     * This static-module check does NOT parse q-values — for a precompressed
+     * `.zst` file the static handler conservatively serves it whenever the
+     * client's Accept-Encoding mentions "zstd" at all, regardless of q-value.
+     * Rationale: the static module is a cache-hit fast path; clients sending
+     * `zstd;q=0` are vanishingly rare and the perf/complexity tradeoff favours
+     * the simpler check here. Revisit in V2 if the divergence causes user-
+     * visible issues; factoring a shared helper is explicitly deferred.
      */
 
     end = ae->data + ae->len;
