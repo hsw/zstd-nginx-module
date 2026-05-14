@@ -33,6 +33,16 @@ typedef struct {
 
     ngx_array_t                 *types_keys;
 
+    /*
+     * 2026-05-15: `zstd_bypass` predicate list. Initialised to
+     * NGX_CONF_UNSET_PTR (not NULL) because ngx_http_set_predicate_slot
+     * uses that sentinel to decide whether to allocate the ngx_array_t
+     * on first directive use — see tmp/src/nginx/src/http/ngx_http_script.c
+     * ngx_http_set_predicate_slot(). A NULL here would make the slot
+     * handler skip array creation and crash on ngx_array_push().
+     */
+    ngx_array_t                 *bypass;
+
     ZSTD_CDict                  *dict;
 } ngx_http_zstd_loc_conf_t;
 
@@ -164,6 +174,13 @@ static ngx_command_t  ngx_http_zstd_filter_commands[] = {
       offsetof(ngx_http_zstd_main_conf_t, dict_file),
       NULL },
 
+    { ngx_string("zstd_bypass"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+      ngx_http_set_predicate_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_zstd_loc_conf_t, bypass),
+      NULL },
+
     ngx_null_command
 };
 
@@ -207,6 +224,36 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     ngx_http_zstd_ctx_t       *ctx;
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
+
+    /*
+     * 2026-05-15: `zstd_bypass` predicate check runs before any other
+     * compression decision (Accept-Encoding, status, content-type,
+     * min/max length) so an operator can short-circuit compression for
+     * specific requests without paying for the per-request checks below.
+     *
+     * Semantics (see tmp/src/nginx/src/http/ngx_http_script.c
+     * ngx_http_test_predicates):
+     *   NGX_OK       — all predicate values are falsy ("", "0")
+     *                  → continue with normal compression decision
+     *   NGX_DECLINED — at least one predicate value is truthy
+     *                  → skip this filter (any-truthy semantics matches
+     *                    proxy_cache_bypass, fastcgi_cache_bypass, etc.)
+     *   NGX_ERROR    — complex value evaluation failed → also skip,
+     *                  conservative since we cannot safely compress
+     *
+     * Hence `!= NGX_OK` covers both DECLINED and ERROR paths uniformly.
+     *
+     * After merge_loc_conf ngx_conf_merge_ptr_value resolves bypass to
+     * either NULL or a valid array (never NGX_CONF_UNSET_PTR), so a
+     * single NULL guard suffices. ngx_http_test_predicates itself also
+     * returns NGX_OK on a NULL array, but we skip the call to avoid a
+     * function entry on the common (no-bypass) path.
+     */
+    if (zlcf->bypass != NULL
+        && ngx_http_test_predicates(r, zlcf->bypass) != NGX_OK)
+    {
+        return ngx_http_next_header_filter(r);
+    }
 
     /*
      * 2026-05-14: r->header_only is intentionally NOT in this rejection
@@ -1031,6 +1078,7 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
     conf->level = NGX_CONF_UNSET;
     conf->min_length = NGX_CONF_UNSET;
     conf->max_length = NGX_CONF_UNSET;
+    conf->bypass = NGX_CONF_UNSET_PTR;
 
     return conf;
 }
@@ -1059,6 +1107,7 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->level, prev->level, 1);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
     ngx_conf_merge_off_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
+    ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                              &prev->types_keys, &prev->types,
