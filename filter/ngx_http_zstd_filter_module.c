@@ -24,6 +24,7 @@ typedef struct {
 typedef struct {
     ngx_flag_t                   enable;
     ngx_int_t                    level;
+    ngx_int_t                    window_bits;
     ssize_t                      min_length;
     off_t                        max_length;
 
@@ -122,6 +123,22 @@ static ngx_http_zstd_comp_level_bounds_t  ngx_http_zstd_comp_level_bounds = {
 };
 
 
+/*
+ * 2026-05-15: zstd_window_bits range. ZSTD_WINDOWLOG_MIN/MAX are 10/27
+ * (libzstd zstd.h). Hard-coded here so the directive is range-checked
+ * even on libzstd < 1.4 where ZSTD_c_windowLog itself is not applied at
+ * runtime (see ngx_http_zstd_filter_create_cstream — the
+ * ZSTD_CCtx_setParameter call is guarded by ZSTD_VERSION_NUMBER >= 10400
+ * and silently no-ops on older builds). Using ngx_conf_num_bounds_t with
+ * the nginx-core ngx_conf_check_num_bounds post-handler — same canonical
+ * pattern as gzip's comp_level (see
+ * tmp/src/nginx/src/http/modules/ngx_http_gzip_filter_module.c:103).
+ */
+static ngx_conf_num_bounds_t  ngx_http_zstd_window_bits_bounds = {
+    ngx_conf_check_num_bounds, 10, 27
+};
+
+
 static ngx_command_t  ngx_http_zstd_filter_commands[] = {
 
     { ngx_string("zstd"),
@@ -138,6 +155,13 @@ static ngx_command_t  ngx_http_zstd_filter_commands[] = {
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_http_zstd_loc_conf_t, level),
       &ngx_http_zstd_comp_level_bounds },
+
+    { ngx_string("zstd_window_bits"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_zstd_loc_conf_t, window_bits),
+      &ngx_http_zstd_window_bits_bounds },
 
     { ngx_string("zstd_types"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
@@ -770,6 +794,38 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
         }
     }
 
+#if ZSTD_VERSION_NUMBER >= 10400
+    /*
+     * 2026-05-15: zstd_window_bits override. ZSTD_c_windowLog (the
+     * advanced-API parameter that ZSTD_CCtx_setParameter takes) was
+     * introduced in libzstd 1.4.0 as part of the stabilised advanced
+     * compression API — see lib/zstd.h "ZSTD_cParameter" enum, marked
+     * stable from 1.4.0. On libzstd 1.3.x the directive parses (range
+     * check still fires at config time via ngx_conf_check_num_bounds)
+     * but is silently a no-op at request time. Plan recommended YAGNI
+     * on a compile-time #warning — operators on legacy distros either
+     * read the docs or notice no change in compressed size; the
+     * fallback is benign.
+     *
+     * Range 10..27 is the libzstd-documented ZSTD_WINDOWLOG_MIN..MAX.
+     * windowLog=27 → 128 MiB window — memory cost lives on the CStream
+     * which we already pool-allocate per request, so the per-request
+     * cost is bounded by libzstd's internal cap.
+     */
+    if (zlcf->window_bits != NGX_CONF_UNSET) {
+        rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_windowLog,
+                                    (int) zlcf->window_bits);
+        if (ZSTD_isError(rc)) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "ZSTD_CCtx_setParameter(ZSTD_c_windowLog, %i) "
+                          "failed: %s",
+                          zlcf->window_bits, ZSTD_getErrorName(rc));
+
+            goto failed;
+        }
+    }
+#endif
+
     return cstream;
 
 failed:
@@ -1076,6 +1132,7 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
 
     conf->enable = NGX_CONF_UNSET;
     conf->level = NGX_CONF_UNSET;
+    conf->window_bits = NGX_CONF_UNSET;
     conf->min_length = NGX_CONF_UNSET;
     conf->max_length = NGX_CONF_UNSET;
     conf->bypass = NGX_CONF_UNSET_PTR;
@@ -1105,6 +1162,7 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->level, prev->level, 1);
+    ngx_conf_merge_value(conf->window_bits, prev->window_bits, NGX_CONF_UNSET);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
     ngx_conf_merge_off_value(conf->max_length, prev->max_length, NGX_CONF_UNSET);
     ngx_conf_merge_ptr_value(conf->bypass, prev->bypass, NULL);
