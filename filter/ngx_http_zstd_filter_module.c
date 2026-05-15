@@ -553,8 +553,18 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
                    ctx->buffer_out.size);
 
-    ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
-    ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
+    /*
+     * Skip the pointer arithmetic when the compressor didn't consume / emit
+     * anything. `in_buf->pos` may be NULL on a flush-only call (sentinel
+     * buffer with no payload); C says NULL+0 is undefined behaviour even
+     * when the delta is zero, which UBSan reports.
+     */
+    if (ctx->buffer_in.pos != pos_in) {
+        ctx->in_buf->pos += ctx->buffer_in.pos - pos_in;
+    }
+    if (ctx->buffer_out.pos != pos_out) {
+        ctx->out_buf->last += ctx->buffer_out.pos - pos_out;
+    }
     ctx->redo = 0;
 
     last_action = ctx->action;
