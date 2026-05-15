@@ -55,25 +55,7 @@ render_conf() {
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
 
-    sed -i 's|^daemon off;|daemon on;|' /etc/nginx/nginx.conf
-}
-
-start_local_nginx() {
-    nginx -t -c /etc/nginx/nginx.conf >/tmp/nginx-t.log 2>&1 || {
-        echo "nginx -t failed:" >&2
-        cat /tmp/nginx-t.log >&2
-        return 1
-    }
-    nginx -c /etc/nginx/nginx.conf
-    local i=0
-    while ! curl -fsS --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1; do
-        i=$((i + 1))
-        if [ "$i" -ge 30 ]; then
-            echo "nginx did not start within 3s" >&2
-            return 1
-        fi
-        sleep 0.1
-    done
+    apply_daemon_mode /etc/nginx/nginx.conf
 }
 
 # Refuse to run on non-brotli variants — t/run.sh already gates this script,
@@ -85,7 +67,7 @@ if ! nginx -V 2>&1 | grep -q ngx_brotli; then
 fi
 
 render_conf
-start_local_nginx
+start_local_nginx_bg /etc/nginx/nginx.conf
 
 PASS=0
 FAIL=0

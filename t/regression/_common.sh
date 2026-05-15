@@ -71,6 +71,81 @@ stop_local_nginx() {
     rm -f /tmp/nginx.pid
 }
 
+# apply_daemon_mode <conf-path> — rewrite the nginx.conf at $1 so the daemon /
+# master_process directives match the current harness mode.
+#
+# Default (ZSTD_REGRESSION_NO_DAEMON unset/empty):
+#   * `daemon off;` → `daemon on;` so `nginx -c ...` exits after fork and the
+#     regression script can continue (sending requests, then nginx -s stop).
+#
+# Harness mode (ZSTD_REGRESSION_NO_DAEMON=1):
+#   * Keep `daemon off;` AND prepend `master_process off;` (if not already
+#     present) so nginx runs as a single in-foreground process. Required by
+#     t/valgrind.sh and t/asan.sh: under daemonize, the worker double-forks
+#     away from the harness, so neither `valgrind --trace-children` nor
+#     `docker exec -e ASAN_OPTIONS … bash regression.sh` captures the worker's
+#     leak/UB findings. Single-process foreground keeps the request handler
+#     inside the harness.
+#
+# Callers should follow with `start_local_nginx_bg` (defined below) when in
+# harness mode — `nginx -c …` would otherwise block forever with daemon off.
+apply_daemon_mode() {
+    local conf="${1:-/etc/nginx/nginx.conf}"
+    if [ -n "${ZSTD_REGRESSION_NO_DAEMON:-}" ]; then
+        # daemon off is already the template default; we only need to add
+        # master_process off to collapse master/worker into one process.
+        if ! grep -q '^master_process ' "$conf"; then
+            # Insert right after the `daemon off;` line so both top-level
+            # directives are co-located.
+            sed -i '/^daemon off;/a\
+master_process off;' "$conf"
+        fi
+    else
+        sed -i 's|^daemon off;|daemon on;|' "$conf"
+    fi
+}
+
+# start_local_nginx_bg <conf-path> — start nginx so the regression script can
+# continue executing requests against it, regardless of ZSTD_REGRESSION_NO_DAEMON.
+#
+# Default mode: `nginx -c ...` daemonizes and returns immediately.
+# Harness mode: `nginx -c ... &` — disowned background job; the caller stops it
+# with `stop_local_nginx` at cleanup. Waits for /tmp/nginx.pid (default mode)
+# or for the listener to come up (harness mode, since there's no pidfile until
+# after listen).
+start_local_nginx_bg() {
+    local conf="${1:-/etc/nginx/nginx.conf}"
+    local port="${ZSTD_TEST_PORT:-8080}"
+    nginx -c "$conf" -t >/tmp/nginx-t.log 2>&1 || {
+        echo "nginx -t failed" >&2
+        cat /tmp/nginx-t.log >&2
+        return 1
+    }
+    if [ -n "${ZSTD_REGRESSION_NO_DAEMON:-}" ]; then
+        # Background so the regression script keeps running. Route nginx
+        # stderr to the SCRIPT's stderr so docker exec captures it in the
+        # asan/valgrind driver's per-script log — this is where ASan
+        # `==ERROR:` reports and valgrind `definitely lost:` lines surface.
+        # If we redirected to /tmp/somefile inside the container, those
+        # findings would be invisible to the host-side driver.
+        # `nohup` would close our stderr inheritance; do not use it.
+        # stdout → stderr; stderr is already inherited from the docker exec.
+        nginx -c "$conf" >&2 &
+        disown >/dev/null 2>&1 || true
+    else
+        nginx -c "$conf"
+    fi
+    local i=0
+    while ! curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null 2>&1; do
+        i=$((i + 1))
+        if [ "$i" -ge 60 ]; then
+            echo "nginx did not start within 6s" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+}
+
 # _log_pass <label> — pretty-prints a green-ish PASS line so regression scripts
 # share a uniform output format. No exit semantics; pure logging.
 _log_pass() {

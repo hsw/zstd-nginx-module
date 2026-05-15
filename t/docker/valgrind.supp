@@ -1,209 +1,62 @@
 # valgrind.supp — Valgrind suppressions for the in-container nginx + zstd build.
 #
-# Filters out known-noise from nginx's own startup and libc/dynamic-linker
-# false positives. Anything not suppressed here that valgrind reports is
-# either a real defect in our zstd module or a real defect in nginx core
-# we should care about.
+# Filters out the standard "free everything when the process dies" nginx-core
+# init-pool allocations that are not defects but show up as `definitely lost`.
+# Anything not suppressed here is either a real defect in our zstd module or a
+# real defect in nginx core we should care about.
 #
-# Curated from the project root's valgrind.suppress (a legacy upstream file)
-# plus targeted suppressions for OpenSSL and the in-container epoll usage.
+# Curated empirically: each stanza below was observed firing in the
+# t/valgrind-logs/raw/*.log output of a full t/valgrind.sh run against the
+# current Dockerfile.valgrind build (gcc -O0 -g, glibc 2.39, valgrind 3.22).
+# Donor-project leftovers from nginx-ssl-fingerprint (OpenSSL noise, libc
+# res_n*, epoll_pwait variants etc.) were dropped — they never matched any
+# leak/error in our run logs.
 
-# --- nginx core init noise ---------------------------------------------------
-
+# Init cycle pool — allocated at startup (main → ngx_init_cycle) and never
+# freed because nginx assumes process-exit reclaims OS memory. Same pattern
+# whether we run nginx -t (single shot) or as a server (foreground).
 {
-   nginx_init_cycle_cond
-   Memcheck:Cond
-   fun:ngx_init_cycle
-   fun:ngx_master_process_cycle
-   fun:main
-}
-{
-   nginx_init_cycle_addr1
-   Memcheck:Addr1
-   fun:ngx_init_cycle
-   fun:ngx_master_process_cycle
-   fun:main
-}
-{
-   nginx_init_cycle_addr4
-   Memcheck:Addr4
-   fun:ngx_init_cycle
-   fun:ngx_master_process_cycle
-   fun:main
-}
-{
-   nginx_create_pool_main
+   nginx_init_cycle_pool_create_main
    Memcheck:Leak
-   match-leak-kinds: definite
-   fun:malloc
-   fun:ngx_alloc
+   match-leak-kinds: definite,indirect
+   fun:posix_memalign
+   fun:ngx_memalign
+   fun:ngx_create_pool
+   fun:ngx_init_cycle
+   fun:main
+}
+
+# Bootstrap log/conf pool — allocated by main() directly at nginx.c:254 before
+# ngx_init_cycle takes over. Distinct from the cycle pool above; same "free
+# on process exit" pattern.
+{
+   nginx_bootstrap_pool_create_main
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:posix_memalign
+   fun:ngx_memalign
    fun:ngx_create_pool
    fun:main
 }
+
+# Worker init: posted-event queue allocations + environment strdup, all kept
+# alive for the lifetime of the process. ngx_event_process_init and
+# ngx_set_environment are nginx-core, not our module.
 {
-   nginx_set_environment_single
+   nginx_event_process_init_alloc
    Memcheck:Leak
-   match-leak-kinds: definite
+   match-leak-kinds: definite,indirect,possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+   ...
+}
+{
+   nginx_set_environment_alloc
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
    fun:malloc
    fun:ngx_alloc
    fun:ngx_set_environment
-   fun:ngx_single_process_cycle
-}
-{
-   nginx_set_environment_worker
-   Memcheck:Leak
-   match-leak-kinds: definite
-   fun:malloc
-   fun:ngx_alloc
-   fun:ngx_set_environment
-   fun:ngx_worker_process_init
-}
-{
-   nginx_crc32_table_init
-   Memcheck:Leak
-   match-leak-kinds: possible
-   fun:malloc
-   fun:ngx_alloc
-   fun:ngx_crc32_table_init
-   fun:main
-}
-
-# --- conf flush / log noise --------------------------------------------------
-
-{
-   nginx_conf_flush_files_single
-   Memcheck:Cond
-   fun:ngx_conf_flush_files
-   fun:ngx_single_process_cycle
-}
-{
-   nginx_conf_flush_files_main
-   Memcheck:Cond
-   fun:ngx_conf_flush_files
-   fun:ngx_single_process_cycle
-   fun:main
-}
-{
-   nginx_vslprintf_logging
-   Memcheck:Cond
-   fun:ngx_vslprintf
-   fun:ngx_snprintf
-   fun:ngx_sock_ntop
-   fun:ngx_event_accept
-   fun:ngx_epoll_process_events
-   fun:ngx_process_events_and_timers
-}
-{
-   nginx_vslprintf_addr
-   Memcheck:Addr1
-   fun:ngx_vslprintf
-   fun:ngx_snprintf
-   fun:ngx_sock_ntop
-   fun:ngx_event_accept
-}
-
-# --- epoll syscall noise -----------------------------------------------------
-
-{
-   nginx_epoll_ctl_event
-   Memcheck:Param
-   epoll_ctl(event)
-   fun:epoll_ctl
-}
-{
-   nginx_epoll_init_param
-   Memcheck:Param
-   epoll_ctl(event)
    ...
-   fun:ngx_epoll_init
-}
-{
-   nginx_epoll_pwait_a
-   Memcheck:Param
-   epoll_pwait(sigmask)
-   fun:epoll_pwait
-   fun:epoll_wait
-   fun:ngx_epoll_process_events
-   fun:ngx_process_events_and_timers
-}
-{
-   nginx_epoll_pwait_b
-   Memcheck:Param
-   epoll_pwait(sigmask)
-   fun:epoll_pwait
-   fun:epoll_wait
-   fun:ngx_epoll_test_rdhup
-   fun:ngx_epoll_init
-   fun:ngx_event_process_init
-}
-{
-   nginx_epoll_pwait_c
-   Memcheck:Param
-   epoll_pwait(sigmask)
-   fun:epoll_pwait
-   fun:ngx_epoll_process_events
-   fun:ngx_process_events_and_timers
-}
-{
-   nginx_epoll_pwait_d
-   Memcheck:Param
-   epoll_pwait(sigmask)
-   fun:epoll_pwait
-   fun:ngx_epoll_test_rdhup
-   fun:ngx_epoll_init
-   fun:ngx_event_process_init
-}
-
-# --- libc / dynamic loader noise --------------------------------------------
-
-{
-   dl_main_index_cond
-   Memcheck:Cond
-   fun:index
-   fun:expand_dynamic_string_token
-   fun:_dl_map_object
-   fun:map_doit
-   fun:_dl_catch_error
-   fun:do_preload
-   fun:dl_main
-   fun:_dl_sysdep_start
-   fun:_dl_start
-}
-{
-   libc_res_nsend
-   Memcheck:Param
-   sendmsg(mmsg[0].msg_hdr)
-   fun:sendmmsg
-   fun:__libc_res_nsend
-}
-{
-   libc_res_nsearch
-   Memcheck:Param
-   sendmsg(mmsg[0].msg_hdr)
-   fun:sendmmsg
-   fun:__libc_res_nsend
-   fun:__libc_res_nquery
-   fun:__libc_res_nquerydomain
-   fun:__libc_res_nsearch
-}
-
-# --- libssl / libcrypto: noise from OpenSSL's own init paths -----------------
-
-{
-   openssl_uninitialized
-   Memcheck:Cond
-   ...
-   obj:*/libcrypto*
-}
-{
-   openssl_value
-   Memcheck:Value8
-   ...
-   obj:*/libcrypto*
-}
-{
-   openssl_libssl
-   Memcheck:Cond
-   ...
-   obj:*/libssl*
 }

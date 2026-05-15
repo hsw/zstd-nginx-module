@@ -60,25 +60,7 @@ render_conf() {
         sed -i '/^load_module /d' /etc/nginx/nginx.conf
     fi
 
-    sed -i 's|^daemon off;|daemon on;|' /etc/nginx/nginx.conf
-}
-
-start_local_nginx() {
-    nginx -c /etc/nginx/nginx.conf -t >/tmp/nginx-t.log 2>&1 || {
-        echo "nginx -t failed" >&2
-        cat /tmp/nginx-t.log >&2
-        return 1
-    }
-    nginx -c /etc/nginx/nginx.conf
-    local i=0
-    while ! curl -fsS --max-time 1 http://127.0.0.1:8080/ >/dev/null 2>&1; do
-        i=$((i + 1))
-        if [ "$i" -ge 30 ]; then
-            echo "nginx did not start within 3s" >&2
-            return 1
-        fi
-        sleep 0.1
-    done
+    apply_daemon_mode /etc/nginx/nginx.conf
 }
 
 # Python fixture: TCP server that lies about Content-Length. Returns
@@ -145,7 +127,7 @@ start_fixture() {
 
 render_conf
 start_fixture
-start_local_nginx
+start_local_nginx_bg /etc/nginx/nginx.conf
 
 # Locate the worker pid so we can measure its CPU time. Under Docker Desktop
 # on macOS, Linux processes run under Rosetta emulation and `pgrep -f` matches
@@ -166,9 +148,16 @@ if [ -z "$WORKER_PID" ]; then
     WORKER_PID="$(ps -e -o pid=,ppid= 2>/dev/null | awk -v m="$MASTER_PID" '$2 == m {print $1; exit}')"
 fi
 if [ -z "$WORKER_PID" ]; then
-    echo "could not find nginx worker pid (master=${MASTER_PID})" >&2
-    ps -e -o pid,ppid,cmd | grep -i nginx >&2 || true
-    exit 1
+    # Single-process mode (master_process off — set under the valgrind / asan
+    # harness so sanitizer findings surface on the captured stderr). The master
+    # IS the worker; sample its CPU time directly.
+    if [ -n "${ZSTD_REGRESSION_NO_DAEMON:-}" ]; then
+        WORKER_PID="$MASTER_PID"
+    else
+        echo "could not find nginx worker pid (master=${MASTER_PID})" >&2
+        ps -e -o pid,ppid,cmd | grep -i nginx >&2 || true
+        exit 1
+    fi
 fi
 
 cpu_jiffies() {

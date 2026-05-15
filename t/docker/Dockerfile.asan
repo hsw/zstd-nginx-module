@@ -84,6 +84,7 @@ RUN cd /usr/local/src/nginx && \
       --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=alignment -Wno-error" \
       --with-ld-opt="-fsanitize=address,undefined -fuse-ld=lld" \
       --with-http_ssl_module \
+      --with-http_v2_module \
       --add-module=/src \
       2>&1 | tail -10 && \
     make -j"$(nproc)" 2>&1 | tail -5 && \
@@ -93,6 +94,7 @@ RUN cd /usr/local/src/nginx && \
 RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi /var/log/nginx
 
 COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/docker/ubsan.supp /etc/ubsan.supp
 COPY t/regression /opt/regression
 
 RUN sed \
@@ -102,24 +104,19 @@ RUN sed \
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
 
-# Sanitizer runtime tuning:
+# Sanitizer runtime tuning. The driver (t/asan.sh) overrides these per-exec
+# with abort_on_error=1 so a finding becomes a HARD test failure (worker
+# aborts → curl gets a connection error → script exits non-zero). The ENV
+# defaults below apply only when the image is run by hand (e.g. for
+# interactive debugging via `docker run --entrypoint bash`).
 #   detect_leaks=0     — nginx allocates pools on startup that it never
 #                        explicitly frees (cycle pool, log pool); on a clean
 #                        exit ASan reports those as leaks. They are *not*
 #                        bugs — they're the standard "free everything when
 #                        the process dies" pattern.
-#   abort_on_error=0   — don't abort the process on a finding; we want nginx
-#                        to keep serving so the next request can still hit
-#                        it (and surface more findings).
-#   exitcode=0         — every UBSan finding under nginx ends up exiting the
-#                        worker, which the master then respawns indefinitely.
-#                        nginx core has a long-known UB (function-pointer
-#                        cast through void*-ctx in ngx_output_chain.c:70)
-#                        that fires on every request; with exitcode!=0
-#                        workers die in a respawn loop. Setting it to 0
-#                        lets the worker continue. The driver still detects
-#                        findings by grepping log output for `runtime error:`
-#                        and `==ERROR:`.
+#   abort_on_error=0   — interactive default keeps the daemon serving so an
+#                        operator can hit it with multiple requests. The
+#                        driver flips this to 1.
 ENV ASAN_OPTIONS=detect_leaks=0:abort_on_error=0:exitcode=0:halt_on_error=0:strict_string_checks=1:check_initialization_order=1:print_stacktrace=1
 ENV UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=0:exitcode=0
 

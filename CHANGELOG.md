@@ -19,6 +19,7 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 - Static-build filter ordering: zstd now registers after brotli in `HTTP_FILTER_MODULES` so the runtime chain is `zstd > br > gzip` regardless of `--add-module` order. Previously the order was indeterminate.
 - Trivial cleanups: C99 `//` comments replaced with `/* */`, `ZSTD_getErrorName(rc)` → `ZSTD_getErrorName(rv)` typo fixed, `ZSTD_minCLevel()` guarded for libzstd < 1.3.6, rpath spacing in build glue, static module H1 parser line-folding correctness.
 - Accept-Encoding short-circuit removed from `ngx_http_zstd_ok`: the bounded parser is now always invoked, so `zstd;q=0` is correctly rejected even when the raw header bytes contain the substring `zstd`.
+- Compress loop: skip the `in_buf->pos` / `out_buf->last` post-increment when libzstd consumed/emitted nothing on a flush-only call. `NULL + 0` is undefined behaviour under C11 §6.5.6/8 and was reported by the UBSan variant added in this release.
 
 ### Added
 

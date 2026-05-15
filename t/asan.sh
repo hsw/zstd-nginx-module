@@ -62,19 +62,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Sanitizer findings are written to stderr (collected in the per-script log)
-# rather than to per-pid files. The per-pid file approach (log_path=…) is
-# fragile across nginx's master/worker fork: the worker inherits the path
-# but writes from a different uid than the dir's owner, producing EACCES.
-# Stderr capture sidesteps that and keeps findings co-located with the
-# regression-script trace anyway.
+# Sanitizer findings are written to stderr (collected in the per-script log).
+# We force the regression scripts into single-process foreground mode
+# (ZSTD_REGRESSION_NO_DAEMON=1) so the request-handling process inherits the
+# stderr captured by `docker exec` — under daemonize, the worker double-forks
+# away from the captured stderr and findings silently disappear into /dev/null.
 
-# Regression set. h2-truncation needs http_v2 (not compiled into this build);
-# filter-priority needs the brotli module (not present). Everything else is
-# in scope.
+# Regression set. filter-priority needs the brotli module (not present in the
+# asan image); h2-truncation needs http_v2 which we now request in
+# Dockerfile.asan so it can exercise the H2 hot-path under sanitizers.
+# dict-reload is excluded: its core assertion is "master RSS does not grow
+# across N nginx -s reload cycles". Reload semantics differ under
+# ZSTD_REGRESSION_NO_DAEMON=1 (master_process off) where there is no master/
+# worker handoff to measure, and ASan instrumentation adds enough non-leak
+# RSS noise per cycle to blow past the 512 KiB threshold even when the CDict
+# cleanup hook is wired up correctly. Leak coverage of the dict path lives in
+# valgrind.sh instead.
 SCRIPTS=(
     accept-encoding.sh
-    dict-reload.sh
+    h2-truncation.sh
     head-parity.sh
     infinite-loop.sh
     new-directives.sh
@@ -84,16 +90,22 @@ overall_rc=0
 for script in "${SCRIPTS[@]}"; do
     log="${LOG_DIR}/${script}.log"
     echo "==> asan :: ${script}"
-    # See Dockerfile.asan ENV block for rationale. The key bits:
-    #   * detect_leaks=0 — nginx cycle pool isn't a leak.
-    #   * exitcode=0 — let workers keep serving after a finding (the well-
-    #     known ngx_output_chain UB would otherwise crash every worker on
-    #     every request).
-    # Findings still show up as `runtime error:` / `==ERROR:` lines in stderr,
-    # which the driver greps for below.
+    # See Dockerfile.asan ENV block for rationale.
+    # Sanitizer abort-on-error rationale: with abort_on_error=1 + halt_on_error=1
+    # the very first finding aborts the worker, which (in single-process mode
+    # set below) takes the listener with it — curl gets a connection error and
+    # the regression script's `nginx -t` / nginx start path bails immediately.
+    # This is the desired behaviour: a finding becomes a HARD test failure
+    # rather than a stderr line the driver might miss with a soft grep. The
+    # earlier `exitcode=0:halt_on_error=0` policy made findings advisory, which
+    # missed UBSan reports under stderr-eating daemonize.
+    #
+    # detect_leaks=0 stays because the nginx cycle pool ("free everything on
+    # exit") looks like a leak to ASan but isn't a defect.
     if docker exec \
-            -e ASAN_OPTIONS="detect_leaks=0:abort_on_error=0:exitcode=0:halt_on_error=0:strict_string_checks=1:check_initialization_order=1:print_stacktrace=1" \
-            -e UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=0:exitcode=0" \
+            -e ZSTD_REGRESSION_NO_DAEMON=1 \
+            -e ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1:strict_string_checks=1:check_initialization_order=1:print_stacktrace=1" \
+            -e UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1:suppressions=/etc/ubsan.supp" \
             "$cid" bash "/opt/regression/${script}" \
             > "$log" 2>&1; then
         echo "  pass  ${script} (log: t/asan-logs/${script}.log)"
