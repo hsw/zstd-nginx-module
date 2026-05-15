@@ -25,7 +25,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
         clang-18 lld-18 \
-        libpcre3-dev libssl-dev zlib1g-dev libzstd-dev \
+        libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
         make \
         curl ca-certificates \
         gnupg lsb-release \

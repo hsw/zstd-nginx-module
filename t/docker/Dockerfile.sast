@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y \
         bear \
         cppcheck \
         python3-pip \
-        libpcre3-dev libssl-dev zlib1g-dev libzstd-dev \
+        libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
         make \
         curl ca-certificates \
         gnupg lsb-release \
