@@ -142,22 +142,11 @@ fi
 # Workers are children of the master. /proc/<pid>/task/<pid>/children is the
 # canonical Linux source-of-truth (works under Rosetta too because /proc is
 # native to the Linux guest).
-WORKER_PID="$(awk '{print $1}' "/proc/${MASTER_PID}/task/${MASTER_PID}/children" 2>/dev/null || true)"
+WORKER_PID="$(nginx_worker_pid "$MASTER_PID")"
 if [ -z "$WORKER_PID" ]; then
-    # Fallback: any process whose ppid is the master.
-    WORKER_PID="$(ps -e -o pid=,ppid= 2>/dev/null | awk -v m="$MASTER_PID" '$2 == m {print $1; exit}')"
-fi
-if [ -z "$WORKER_PID" ]; then
-    # Single-process mode (master_process off — set under the valgrind / asan
-    # harness so sanitizer findings surface on the captured stderr). The master
-    # IS the worker; sample its CPU time directly.
-    if [ -n "${ZSTD_REGRESSION_NO_DAEMON:-}" ]; then
-        WORKER_PID="$MASTER_PID"
-    else
-        echo "could not find nginx worker pid (master=${MASTER_PID})" >&2
-        ps -e -o pid,ppid,cmd | grep -i nginx >&2 || true
-        exit 1
-    fi
+    echo "could not find nginx worker pid (master=${MASTER_PID})" >&2
+    ps -e -o pid,ppid,cmd | grep -i nginx >&2 || true
+    exit 1
 fi
 
 cpu_jiffies() {

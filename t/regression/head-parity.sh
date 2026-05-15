@@ -20,9 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/_common.sh"
 
 LABEL="head-parity"
+TMPDIR="$(mktemp -d)"
 
 cleanup() {
     stop_local_nginx
+    rm -rf "$TMPDIR"
 }
 trap 'cleanup' EXIT
 
@@ -45,9 +47,6 @@ start_local_nginx_bg /etc/nginx/nginx.conf
 
 PASS=0
 FAIL=0
-
-TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"; cleanup' EXIT
 
 URL="http://127.0.0.1:8080/text"
 

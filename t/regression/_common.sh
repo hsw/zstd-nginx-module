@@ -4,13 +4,13 @@
 #
 # Conventions:
 #   * Regression scripts render an nginx config and run nginx in-container via
-#     start_local_nginx / stop_local_nginx — no separate docker container is
+#     start_local_nginx_bg / stop_local_nginx — no separate docker container is
 #     started by these helpers.
-#   * Default test port is 8080; override with $ZSTD_TEST_PORT.
+#   * The test port is hardcoded to 8080 across all scripts. Don't add an
+#     override — keep config simple; if isolation across concurrent runs is
+#     ever needed, rev all 7 regression scripts at once.
 
 set -uo pipefail
-
-ZSTD_TEST_PORT="${ZSTD_TEST_PORT:-8080}"
 
 # assert_header <headers-blob> <header-name> <expected-value>
 # Case-insensitive header name match; exact value match. Exits 1 on failure.
@@ -115,7 +115,6 @@ master_process off;' "$conf"
 # after listen).
 start_local_nginx_bg() {
     local conf="${1:-/etc/nginx/nginx.conf}"
-    local port="${ZSTD_TEST_PORT:-8080}"
     nginx -c "$conf" -t >/tmp/nginx-t.log 2>&1 || {
         echo "nginx -t failed" >&2
         cat /tmp/nginx-t.log >&2
@@ -136,7 +135,7 @@ start_local_nginx_bg() {
         nginx -c "$conf"
     fi
     local i=0
-    while ! curl -fsS --max-time 1 "http://127.0.0.1:${port}/" >/dev/null 2>&1; do
+    while ! curl -fsS --max-time 1 "http://127.0.0.1:8080/" >/dev/null 2>&1; do
         i=$((i + 1))
         if [ "$i" -ge 60 ]; then
             echo "nginx did not start within 6s" >&2
@@ -144,6 +143,29 @@ start_local_nginx_bg() {
         fi
         sleep 0.1
     done
+}
+
+# nginx_worker_pid <master-pid> — resolve the worker pid driving requests for
+# the given master. In single-process mode (master_process off — used under the
+# valgrind/asan harness so worker stderr stays attached), there's no separate
+# worker: the master process IS the worker. Returns the worker pid on stdout,
+# or empty string if nothing was found (caller decides whether that's fatal).
+nginx_worker_pid() {
+    local master="$1"
+    local pid
+
+    pid="$(awk '{print $1}' "/proc/${master}/task/${master}/children" 2>/dev/null || true)"
+    if [ -z "$pid" ]; then
+        pid="$(ps -e -o pid=,ppid= 2>/dev/null | awk -v m="$master" '$2 == m {print $1; exit}')"
+    fi
+    if [ -z "$pid" ]; then
+        # Single-process mode: master is the worker.
+        if ! ps -p "$master" >/dev/null 2>&1; then
+            return 0
+        fi
+        pid="$master"
+    fi
+    printf '%s\n' "$pid"
 }
 
 # _log_pass <label> — pretty-prints a green-ish PASS line so regression scripts
