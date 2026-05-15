@@ -133,23 +133,26 @@ docker exec "$cid" sh -c 'ls /tmp/valgrind.*.log 2>/dev/null || true' \
         docker cp "${cid}:${f}" "$out" >/dev/null 2>&1 || true
     done
 
-# Scan for "definitely lost" with nonzero byte counts. We deliberately ignore
-# "indirectly lost" reports on their own: an indirectly-lost block is, by
-# valgrind's definition, reachable from another lost-or-reachable allocation.
-# When that root is a known/suppressed nginx-core init pool ("free everything
-# at process exit"), valgrind STILL reports the indirect chain under
-# `indirectly lost` even though the supp suppresses the root. Treating
-# definite-only as the actionable signal mirrors how nginx-ssl-fingerprint's
-# valgrind harness gates pass/fail. If you want to see the full breakdown,
-# read the per-pid logs in t/valgrind-logs/raw/.
+# Scan for:
+#   * "definitely lost" with nonzero byte counts (real leaks)
+#   * Any memcheck error class: Invalid read, Invalid write, use of
+#     uninitialised value, mismatched free/delete, etc. (these surface
+#     as "ERROR SUMMARY: N errors" with N>0).
+# We ignore "indirectly lost" reports on their own: an indirectly-lost block
+# is, by valgrind's definition, reachable from another lost-or-reachable
+# allocation. When that root is a known/suppressed nginx-core init pool
+# ("free everything at process exit"), valgrind STILL reports the indirect
+# chain even though the supp suppresses the root. For full breakdown, read
+# the per-pid logs in t/valgrind-logs/raw/.
 echo
 echo "=== valgrind findings ==="
 found_real=0
 for f in "${LOG_DIR}/raw"/*.log; do
     [ -f "$f" ] || continue
-    if grep -E 'definitely lost: [1-9]' "$f" >/dev/null 2>&1; then
+    if grep -E 'definitely lost: [1-9]' "$f" >/dev/null 2>&1 \
+       || grep -E 'ERROR SUMMARY: [1-9]' "$f" >/dev/null 2>&1; then
         echo "--- ${f#${REPO_ROOT}/} ---"
-        grep -E 'definitely lost:|indirectly lost:|possibly lost:|still reachable:' "$f" | head -8
+        grep -E 'definitely lost:|indirectly lost:|possibly lost:|still reachable:|ERROR SUMMARY:|Invalid (read|write)|Conditional jump|Use of uninitialised' "$f" | head -12
         found_real=1
     fi
 done
