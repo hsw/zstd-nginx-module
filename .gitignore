@@ -57,3 +57,9 @@ t/servroot/*
 .claude/
 tmp/
 docs/
+
+# Local-only output of SAST / Valgrind / ASan docker variants. Findings are
+# advisory; logs are not committed.
+t/sast-results/
+t/valgrind-logs/
+t/asan-logs/

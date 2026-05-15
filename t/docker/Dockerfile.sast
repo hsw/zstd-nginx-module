@@ -1,0 +1,100 @@
+# Dockerfile.sast — static analysis image for zstd-nginx-module.
+#
+# Bundles five SAST tools and a sample nginx-source checkout so they have the
+# include paths they need to analyse our two module .c files:
+#   * scan-build (Clang Static Analyzer)
+#   * clang-tidy (with clang-analyzer + bugprone + cert checks)
+#   * cppcheck
+#   * gcc -fanalyzer
+#   * flawfinder
+#
+# Run all tools:        docker run --rm -v "$PWD/t/sast-results:/work/sast-results" zstd-nginx-sast
+# Run a single tool:    docker run --rm -v "$PWD/t/sast-results:/work/sast-results" zstd-nginx-sast cppcheck
+#
+# The driver `t/sast.sh` builds this image and runs it for you. Results land
+# under `t/sast-results/<tool>.log` on the host.
+#
+# Module targets are explicitly:
+#   /work/module/filter/ngx_http_zstd_filter_module.c
+#   /work/module/static/ngx_http_zstd_static_module.c
+#
+# Adapted from nginx-ssl-fingerprint's tmp/docker/sast.Dockerfile. Differences:
+#   * Drops OpenSSL/JA-patch machinery — zstd module needs no patched OpenSSL.
+#   * Drops stream/ngx_http_v2 SAST targets — zstd module touches neither.
+#   * Pulls nginx source from nginx.org (mainline tarball), not git, to match
+#     the same upstream pin every other Dockerfile.* variant uses.
+#   * Uses --with-zlib_asan… no, just installs libzstd-dev like the other variants.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+        clang-18 \
+        clang-tools-18 \
+        clang-tidy-18 \
+        gcc \
+        bear \
+        cppcheck \
+        python3-pip \
+        libpcre3-dev libssl-dev zlib1g-dev libzstd-dev \
+        make \
+        curl ca-certificates \
+        gnupg lsb-release \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s /usr/bin/clang-18 /usr/local/bin/clang \
+    && ln -s /usr/bin/clang++-18 /usr/local/bin/clang++ \
+    && ln -s /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy \
+    && ln -s /usr/bin/scan-build-18 /usr/local/bin/scan-build \
+    && pip install --break-system-packages flawfinder
+
+# Pin to nginx.org mainline (matches the other Dockerfile.ubuntu-* variants).
+# We discover the version by installing the apt package, then grabbing the
+# matching source tarball — same pattern the runtime variants use.
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update \
+ && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /work \
+ && tar -C /work -xzf /tmp/nginx.tar.gz \
+ && ln -s "/work/nginx-${NGINX_VERSION}" /work/nginx \
+ && rm -f /tmp/nginx.tar.gz
+
+RUN mkdir -p /work/sast-results
+
+WORKDIR /work
+
+# Module sources. We copy the whole subset that the top-level `config`
+# script sources (filter/, static/, and the top-level `config` itself).
+# A single --add-module=/work/module is the supported entry point — the
+# top-level config wires both submodules. Pointing --add-module at one of
+# the subdirs directly breaks because the inner configs assume
+# $ngx_addon_dir is the repo root.
+COPY config /work/module/config
+COPY filter /work/module/filter
+COPY static /work/module/static
+
+# Configure nginx (clang); bear captures compile_commands.json for clang-tidy.
+# --with-compat keeps configure permissive (no platform-specific assumptions).
+RUN cd /work/nginx && \
+    ./configure \
+      --with-cc=clang \
+      --with-cc-opt="-Wno-error" \
+      --with-compat \
+      --with-http_ssl_module \
+      --add-module=/work/module \
+      2>&1 | tail -20 && \
+    bear -- make -j"$(nproc)" 2>&1 | tail -10 && \
+    echo "compile_commands.json entries: $(grep -c '\"file\"' compile_commands.json || echo 0)"
+
+COPY t/docker/run-sast.sh /usr/local/bin/run-sast
+RUN chmod +x /usr/local/bin/run-sast
+
+ENTRYPOINT ["/usr/local/bin/run-sast"]
+CMD ["all"]
