@@ -35,12 +35,11 @@ typedef struct {
     ngx_array_t                 *types_keys;
 
     /*
-     * 2026-05-15: `zstd_bypass` predicate list. Initialised to
-     * NGX_CONF_UNSET_PTR (not NULL) because ngx_http_set_predicate_slot
-     * uses that sentinel to decide whether to allocate the ngx_array_t
-     * on first directive use — see tmp/src/nginx/src/http/ngx_http_script.c
-     * ngx_http_set_predicate_slot(). A NULL here would make the slot
-     * handler skip array creation and crash on ngx_array_push().
+     * `zstd_bypass` predicate list. Initialised to NGX_CONF_UNSET_PTR
+     * (not NULL) because ngx_http_set_predicate_slot uses that sentinel
+     * to decide whether to allocate the ngx_array_t on first directive
+     * use. A NULL here would make the slot handler skip array creation
+     * and crash on ngx_array_push().
      */
     ngx_array_t                 *bypass;
 
@@ -114,7 +113,8 @@ static ngx_int_t ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
 static void * ngx_http_zstd_filter_alloc(void *opaque, size_t size);
 static void ngx_http_zstd_filter_free(void *opaque, void *address);
 static char *ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data);
-static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cdict_cleanup(void *data);
 
 
@@ -124,15 +124,14 @@ static ngx_http_zstd_comp_level_bounds_t  ngx_http_zstd_comp_level_bounds = {
 
 
 /*
- * 2026-05-15: zstd_window_bits range. ZSTD_WINDOWLOG_MIN/MAX are 10/27
- * (libzstd zstd.h). Hard-coded here so the directive is range-checked
- * even on libzstd < 1.4 where ZSTD_c_windowLog itself is not applied at
- * runtime (see ngx_http_zstd_filter_create_cstream — the
- * ZSTD_CCtx_setParameter call is guarded by ZSTD_VERSION_NUMBER >= 10400
- * and silently no-ops on older builds). Using ngx_conf_num_bounds_t with
- * the nginx-core ngx_conf_check_num_bounds post-handler — same canonical
- * pattern as gzip's comp_level (see
- * tmp/src/nginx/src/http/modules/ngx_http_gzip_filter_module.c:103).
+ * zstd_window_bits range. ZSTD_WINDOWLOG_MIN/MAX are 10/27 (libzstd
+ * zstd.h). Hard-coded here so the directive is range-checked even on
+ * libzstd < 1.4 where ZSTD_c_windowLog itself is not applied at runtime
+ * (see ngx_http_zstd_filter_create_cstream — the ZSTD_CCtx_setParameter
+ * call is guarded by ZSTD_VERSION_NUMBER >= 10400 and silently no-ops on
+ * older builds). Using ngx_conf_num_bounds_t with the nginx-core
+ * ngx_conf_check_num_bounds post-handler — same canonical pattern as
+ * gzip's comp_level.
  */
 static ngx_conf_num_bounds_t  ngx_http_zstd_window_bits_bounds = {
     ngx_conf_check_num_bounds, 10, 27
@@ -250,22 +249,23 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
     /*
-     * 2026-05-15: `zstd_bypass` predicate check runs before any other
-     * compression decision (Accept-Encoding, status, content-type,
-     * min/max length) so an operator can short-circuit compression for
-     * specific requests without paying for the per-request checks below.
+     * `zstd_bypass` predicate check runs before any other compression
+     * decision (Accept-Encoding, status, content-type, min/max length)
+     * so an operator can short-circuit compression for specific requests
+     * without paying for the per-request checks below.
      *
-     * Semantics (see tmp/src/nginx/src/http/ngx_http_script.c
-     * ngx_http_test_predicates):
+     * Semantics (mirrors `ngx_http_test_predicates()`):
      *   NGX_OK       — all predicate values are falsy ("", "0")
      *                  → continue with normal compression decision
      *   NGX_DECLINED — at least one predicate value is truthy
      *                  → skip this filter (any-truthy semantics matches
      *                    proxy_cache_bypass, fastcgi_cache_bypass, etc.)
-     *   NGX_ERROR    — complex value evaluation failed → also skip,
-     *                  conservative since we cannot safely compress
-     *
-     * Hence `!= NGX_OK` covers both DECLINED and ERROR paths uniformly.
+     *   NGX_ERROR    — complex value evaluation failed (e.g. script-
+     *                  engine OOM) → propagate the error to the caller
+     *                  rather than silently disabling compression. This
+     *                  mirrors the canonical pattern in upstream
+     *                  ngx_http_upstream_cache() handling of
+     *                  cache_bypass.
      *
      * After merge_loc_conf ngx_conf_merge_ptr_value resolves bypass to
      * either NULL or a valid array (never NGX_CONF_UNSET_PTR), so a
@@ -273,14 +273,19 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
      * returns NGX_OK on a NULL array, but we skip the call to avoid a
      * function entry on the common (no-bypass) path.
      */
-    if (zlcf->bypass != NULL
-        && ngx_http_test_predicates(r, zlcf->bypass) != NGX_OK)
-    {
-        return ngx_http_next_header_filter(r);
+    if (zlcf->bypass != NULL) {
+        switch (ngx_http_test_predicates(r, zlcf->bypass)) {
+        case NGX_ERROR:
+            return NGX_ERROR;
+        case NGX_DECLINED:
+            return ngx_http_next_header_filter(r);
+        default: /* NGX_OK */
+            break;
+        }
     }
 
     /*
-     * 2026-05-14: r->header_only is intentionally NOT in this rejection
+     * r->header_only is intentionally NOT in this rejection
      * block. HEAD requests need the same Content-Encoding / Vary /
      * cleared-Content-Length headers as GET so client tooling that
      * probes via HEAD before deciding to download sees the correct
@@ -566,7 +571,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
                && ctx->in == NULL)
     {
         /*
-         * 2026-05-01 (tommytaylor.co.uk): only transition to END once the
+         * Only transition to END once the
          * current ZSTD_inBuffer is fully drained AND no more chain links
          * are queued. Without these gates, libzstd's "131072 bytes still
          * pending" hint return on the same body-filter call that carried
@@ -617,7 +622,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     }
 
     /*
-     * 2026-05-01 (tommytaylor.co.uk truncation fix): only mark the response
+     * Only mark the response
      * "done" once ZSTD_endStream has actually run (action == END). The
      * original code set b->last_buf=1 + done=1 after a FLUSH-rc=0 cycle
      * with last==1, even when buffer_in still had unconsumed bytes.
@@ -911,11 +916,10 @@ ngx_http_zstd_quantity(u_char *p, u_char *last)
  * with conflicting q-values, last-accept-wins is approximated by
  * first-accept-wins here — sufficient for V1). Default (no q) = accept.
  *
- * Modelled on ngx_http_gzip_accept_encoding() at
- * tmp/src/nginx/src/http/ngx_http_core_module.c:2266-2330 with two
- * deviations: (1) iterate past q=0 to find another zstd token instead of
- * returning DECLINED on first match; (2) accept TAB as token whitespace
- * (RFC 9110 OWS).
+ * Modelled on ngx_http_gzip_accept_encoding() with two deviations:
+ * (1) iterate past q=0 to find another zstd token instead of returning
+ * DECLINED on first match; (2) accept TAB as token whitespace (RFC 9110
+ * OWS).
  */
 static ngx_int_t
 ngx_http_zstd_accept_encoding(ngx_str_t *ae)
@@ -1398,7 +1402,8 @@ ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data)
 }
 
 static char *
-ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf)
 {
     char  *p = conf;
 
