@@ -42,4 +42,8 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 - PR #49 (HTTP/2 truncation fix): Tom Taylor &lt;me@tommytaylor.co.uk&gt;, cherry-picked from `t0mtaylor/zstd-nginx-module`.
 - PR #23 (infinite-loop fix): drawing &lt;cppbreak@qq.com&gt;, cherry-picked from upstream `tokers/zstd-nginx-module`.
 
+### Prior art
+
+- `zstd_max_length` and `zstd_bypass` directives: the idea (directive names + the two specific predicates) is prior art from Hanada's [`HanadaLee/ngx_http_zstd_module`](https://github.com/HanadaLee/ngx_http_zstd_module) commit [`9fde8fec`](https://github.com/HanadaLee/ngx_http_zstd_module/commit/9fde8fec89bc9517740e65b8ac2aec6ecc989d41) (2024-11-01, "feature: added new directives zstd_max_length and zstd_bypass"). This fork re-implemented both directives independently against nginx core conventions (`ngx_conf_set_off_slot` + `ngx_http_set_predicate_slot`); the concrete differences are: `off_t` vs `ssize_t` field type, `NGX_CONF_UNSET` vs `0` merge default, and bypass-check position at the top of the header filter (vs after the rejection compound in HanadaLee). The independent implementation was not deliberate — Tasks 9/10 in the V1 plan referenced nginx-core `proxy_cache_bypass` and `gzip_disable` as templates without surfacing HanadaLee's prior implementation to the executing agent. Naming and registration patterns convergently matched because nginx idioms are rigid. Attribution acknowledged here rather than via commit-message amendment to avoid rewriting the 24-commit V1 branch.
+
 [0.2.0]: https://github.com/shomenkow/zstd-nginx-module/releases/tag/v0.2.0
