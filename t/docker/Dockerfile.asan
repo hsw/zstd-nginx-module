@@ -60,6 +60,13 @@ COPY static /src/static
 # UB but are safe on x86_64/arm64. -fno-omit-frame-pointer makes the stack
 # traces actually useful.
 #
+# -DNGX_DEBUG_PALLOC=1 routes every ngx_palloc_small() through ngx_alloc()
+# instead of bumping from the pool's pre-allocated chunk. Without it, ASan
+# only red-zones the parent pool block — overflows inside individual
+# pool-allocated buffers are invisible. With it, each allocation gets its
+# own redzone, which catches off-by-one / heap-overflow / use-after-free
+# bugs in pool-backed memory (which is most of our module's hot path).
+#
 # ASAN_OPTIONS=detect_leaks=0 during configure: nginx's auto/feature compiles
 # and *runs* a tiny ZSTD_createCCtx() probe. Under ASan that leaks the
 # returned cctx (which is intentional in the probe — it never frees), so the
@@ -81,7 +88,7 @@ RUN cd /usr/local/src/nginx && \
       --http-log-path=/var/log/nginx/access.log \
       --modules-path=/etc/nginx/modules \
       --with-cc=clang \
-      --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=alignment -Wno-error" \
+      --with-cc-opt="-O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=alignment -DNGX_DEBUG_PALLOC=1 -Wno-error" \
       --with-ld-opt="-fsanitize=address,undefined -fuse-ld=lld" \
       --with-http_ssl_module \
       --with-http_v2_module \
