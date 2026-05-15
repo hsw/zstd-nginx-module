@@ -608,17 +608,19 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     b = ctx->out_buf;
     if (ngx_buf_size(b) == 0) {
         /*
-         * Sentinel buf emitted only to carry last_buf=1 / flush flags when
-         * the compressor produced no output this cycle. Tag it with the
-         * module address so ngx_chain_update_chains recognises it as ours
-         * and recycles it via ctx->free instead of accounting it against
-         * zlcf->bufs.num.
+         * Sentinel buf to carry last_buf=1 / flush flags when the compressor
+         * produced no output this cycle. NOT tagged with the module address
+         * deliberately: tagging would let ngx_chain_update_chains recycle a
+         * zero-storage buf back into ctx->free, where a later
+         * ngx_http_zstd_filter_get_buf() could pick it as the compressor's
+         * output buffer (pos==last==NULL → crash on the next compress call).
+         * One transient untagged buf per zero-output flush is cheaper than
+         * managing a recycling lifecycle for an empty payload.
          */
         b = ngx_calloc_buf(ctx->request->pool);
         if (b == NULL) {
             return NGX_ERROR;
         }
-        b->tag = (ngx_buf_tag_t) &ngx_http_zstd_filter_module;
     }
 
     /*

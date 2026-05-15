@@ -342,8 +342,7 @@ ngx_http_zstd_accept_encoding(ngx_str_t *ae)
         }
 
         if (p == ae->data
-            || *(p - 1) == ',' || *(p - 1) == ';'
-            || *(p - 1) == ' ' || *(p - 1) == '\t')
+            || *(p - 1) == ',' || *(p - 1) == ' ' || *(p - 1) == '\t')
         {
             u_char  *q = p + (sizeof("zstd") - 1);
 

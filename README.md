@@ -172,6 +172,8 @@ Larger window sizes typically yield a better compression ratio at the cost of mo
 
 Requires libzstd 1.4 or newer. When the module is built against an older libzstd the directive is parsed and accepted but ignored at runtime, so configuration remains portable across hosts.
 
+Combining `zstd_window_bits` with `zstd_dict_file` is unsupported: the CDict is created from `zstd_comp_level` only, and libzstd derives the compression window from the dict — the explicit override has no effect. Use one or the other.
+
 ## ngx_http_zstd_static_module
 
 The `ngx_http_zstd_static_module` module allows sending precompressed files with the `.zst` filename extension instead of regular files.

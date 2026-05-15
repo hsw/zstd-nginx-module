@@ -7,22 +7,28 @@ ngx_zstd_opt_I=
 ngx_zstd_opt_L=
 
 if [ -n "$ZSTD_INC" -o -n "$ZSTD_LIB" ]; then
-    ngx_feature="ZStandard static library in $ZSTD_INC and $ZSTD_LIB"
     ngx_feature_path=$ZSTD_INC
-
-    # we try the static shared library firstly
     ngx_zstd_opt_I="-I$ZSTD_INC -DZSTD_STATIC_LINKING_ONLY"
-    ngx_zstd_opt_L="$ZSTD_LIB/libzstd.a"
-    SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
-    CC_TEST_FLAGS="$ngx_zstd_opt_I $CC_TEST_FLAGS"
-    SAVED_NGX_TEST_LD_OPT=$NGX_TEST_LD_OPT
-    NGX_TEST_LD_OPT="$ngx_zstd_opt_L $NGX_TEST_LD_OPT"
 
-    . auto/feature
+    if [ "$ngx_module_link" = DYNAMIC ]; then
+        # Dynamic modules must link the shared library; the distro static
+        # archive typically lacks -fPIC and would fail the .so link anyway.
+        ngx_found=no
+    else
+        # Static (--add-module) builds may prefer the static archive.
+        ngx_feature="ZStandard static library in $ZSTD_INC and $ZSTD_LIB"
+        ngx_zstd_opt_L="$ZSTD_LIB/libzstd.a"
+        SAVED_CC_TAST_FLAGS=$CC_TEST_FLAGS
+        CC_TEST_FLAGS="$ngx_zstd_opt_I $CC_TEST_FLAGS"
+        SAVED_NGX_TEST_LD_OPT=$NGX_TEST_LD_OPT
+        NGX_TEST_LD_OPT="$ngx_zstd_opt_L $NGX_TEST_LD_OPT"
 
-    # restore
-    CC_TEST_FLAGS=$SAVED_CC_TAST_FLAGS
-    NGX_TEST_LD_OPT=$SAVED_NGX_TEST_LD_OPT
+        . auto/feature
+
+        # restore
+        CC_TEST_FLAGS=$SAVED_CC_TAST_FLAGS
+        NGX_TEST_LD_OPT=$SAVED_NGX_TEST_LD_OPT
+    fi
 
     if [ $ngx_found = no ]; then
         # then try the dynamic shared library
