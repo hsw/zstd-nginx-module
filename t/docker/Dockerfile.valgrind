@@ -69,7 +69,7 @@ RUN cd /usr/local/src/nginx && \
       --error-log-path=/var/log/nginx/error.log \
       --http-log-path=/var/log/nginx/access.log \
       --modules-path=/etc/nginx/modules \
-      --with-cc-opt="-O0 -g -fno-omit-frame-pointer -Wno-error" \
+      --with-cc-opt="-O0 -g -fno-omit-frame-pointer -DNGX_DEBUG_PALLOC=1 -Wno-error" \
       --with-http_ssl_module \
       --with-http_v2_module \
       --add-module=/src \
