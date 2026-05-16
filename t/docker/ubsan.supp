@@ -1,0 +1,22 @@
+# ubsan.supp — UBSan runtime suppressions for the in-container nginx + zstd build.
+#
+# Filters out long-known nginx-core UB that isn't our module's bug. Without
+# these, halt_on_error=1 + abort_on_error=1 (set by t/asan.sh so OUR findings
+# become hard test failures) would kill the worker on the very first request
+# via these nginx-internal patterns.
+#
+# Format: <check>:<symbol-or-file>. Wildcards allowed. See
+# https://clang.llvm.org/docs/UndefinedBehaviorSanitizer.html#runtime-suppressions
+#
+# Each entry below is the nginx-core minimum we have to suppress so the
+# request hot-path can complete. If you add a new suppression here, write the
+# nginx commit / file:line in the comment so future readers can audit.
+
+# nginx-core dispatches output_chain handlers through a void*-ctx function
+# pointer that doesn't match the registered prototype. ngx_output_chain.c:70.
+# Fires on every request that produces output. Not zstd module's bug.
+function:ngx_output_chain
+
+# Same pattern in chain-write helpers used by H2/H3 framers; nginx-core casts
+# through void*. Triggers on h2-truncation.sh requests.
+function:ngx_chain_writer
