@@ -1,0 +1,123 @@
+# Dockerfile.angie — angie + zstd module built from source on Ubuntu.
+#
+# Purpose: verify that bug #4b (flush-promotion freeze on chunked/SSE) and
+# the rest of our test suite reproduce identically on angie. Angie 1.11.5
+# is built on nginx core 1.29.3 — the same base Stensel8 reported the
+# WebSocket freeze on.
+#
+# Build args (mirrors Dockerfile.dynamic):
+#   UBUNTU_VERSION  ubuntu base image tag (e.g. 22.04, 24.04, 26.04).
+#   ANGIE_VERSION   angie release to download from download.angie.software.
+#
+# Why Ubuntu base (not Alpine): matches the production deployment shape —
+# glibc, same libc behavior as a real prod box.
+#
+# Why build from source (not from the official angie image / apt repo):
+# the official angie binary is built without `--with-compat`, so external
+# modules built with --with-compat fail to load ("module is not binary
+# compatible"). Building both binary and module ourselves with the same
+# flag set sidesteps this. No public angie apt repo for noble was found
+# at probe time.
+#
+# RFC 8441 (extended CONNECT for WebSocket-over-HTTP/2) is NOT supported
+# in angie 1.11.5 — verified by inspecting src/http/v2/ngx_http_v2.c
+# (returns 405 NOT ALLOWED for any HTTP/2 CONNECT). This image therefore
+# cannot test the WS-over-H2 axis either; that V2 axis blocks on upstream
+# RFC 8441 support.
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG ANGIE_VERSION=1.11.5
+ENV ANGIE_VERSION=${ANGIE_VERSION}
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates \
+        build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
+        zstd python3 python3-venv python3-pip openssl pkg-config \
+ && rm -rf /var/lib/apt/lists/* \
+ && curl -fsSL "https://download.angie.software/files/angie-${ANGIE_VERSION}.tar.gz" -o /tmp/angie.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/angie.tar.gz \
+ && ln -s "/usr/local/src/angie-${ANGIE_VERSION}" /usr/local/src/angie \
+ && rm -f /tmp/angie.tar.gz
+
+COPY config /src/config
+COPY filter /src/filter
+COPY static /src/static
+
+# Build angie + zstd dynamic module with --with-compat so the .so is
+# loadable. Enable only modules our tests need (http_v2 + http_ssl);
+# skip angie-specific ACME/MQTT/RDP modules — not relevant to zstd
+# filter regression.
+RUN cd /usr/local/src/angie \
+ && ./configure \
+        --prefix=/etc/angie \
+        --conf-path=/etc/angie/angie.conf \
+        --sbin-path=/usr/sbin/angie \
+        --pid-path=/tmp/nginx.pid \
+        --error-log-path=/var/log/angie/error.log \
+        --http-log-path=/var/log/angie/access.log \
+        --modules-path=/usr/lib/angie/modules \
+        --http-client-body-temp-path=/var/cache/angie/client_temp \
+        --http-fastcgi-temp-path=/var/cache/angie/fastcgi_temp \
+        --http-proxy-temp-path=/var/cache/angie/proxy_temp \
+        --http-scgi-temp-path=/var/cache/angie/scgi_temp \
+        --http-uwsgi-temp-path=/var/cache/angie/uwsgi_temp \
+        --with-compat \
+        --with-http_ssl_module \
+        --with-http_v2_module \
+        --add-dynamic-module=/src \
+ && make -j"$(nproc)" \
+ && make install \
+ && cp objs/*.so /usr/lib/angie/modules/
+
+# Python venv (mirrors Dockerfile.dynamic).
+COPY t/docker/requirements.txt /opt/requirements.txt
+RUN python3 -m venv /opt/test-venv \
+ && /opt/test-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/test-venv/bin/pip install --no-cache-dir -r /opt/requirements.txt
+ENV PATH=/opt/test-venv/bin:$PATH
+
+# Self-signed cert for HTTP/2 tests (httpx needs TLS+ALPN for h2).
+RUN openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout /etc/angie/test-key.pem \
+        -out /etc/angie/test-cert.pem \
+        -days 3650 -subj "/CN=test" 2>/dev/null \
+ && chmod 0644 /etc/angie/test-key.pem /etc/angie/test-cert.pem
+
+# Angie resolves `load_module modules/...` relative to its --prefix
+# (/etc/angie), not --modules-path. Symlink so the relative path resolves.
+RUN ln -sf /usr/lib/angie/modules /etc/angie/modules
+
+# Mirror nginx paths the conftest expects. Tests hardcode /etc/nginx/test-*.pem
+# inside extra_server blocks — symlink so angie can open the cert files.
+RUN mkdir -p /etc/nginx /etc/nginx/templates /etc/nginx/modules \
+ && ln -sf /etc/angie/test-cert.pem /etc/nginx/test-cert.pem \
+ && ln -sf /etc/angie/test-key.pem /etc/nginx/test-key.pem
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+# `nginx` command resolves to angie; module symlinks under the path the
+# template's load_module directive uses.
+RUN ln -sf /usr/sbin/angie /usr/local/bin/nginx \
+ && ln -sf /usr/lib/angie/modules/ngx_http_zstd_filter_module.so \
+           /etc/nginx/modules/ngx_http_zstd_filter_module.so \
+ && ln -sf /usr/lib/angie/modules/ngx_http_zstd_static_module.so \
+           /etc/nginx/modules/ngx_http_zstd_static_module.so
+
+RUN mkdir -p /var/fixtures/random /var/cache/angie/client_temp /var/cache/angie/fastcgi_temp \
+        /var/cache/angie/proxy_temp /var/cache/angie/scgi_temp /var/cache/angie/uwsgi_temp \
+        /var/log/angie /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi \
+ && sed \
+        -e 's|__LOAD_MODULES__|load_module modules/ngx_http_zstd_filter_module.so;|' \
+        -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_SERVER__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+CMD ["angie", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
