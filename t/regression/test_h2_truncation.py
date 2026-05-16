@@ -75,9 +75,19 @@ def h2_nginx():
     )
     # http2 on; at http context (nginx mainline 1.25.1+ accepts it here).
     # TLS listener for ALPN-negotiated HTTP/2 — see H2_BASE_URL above.
+    #
+    # output_buffers 1 1m + sendfile on + aio off are required to repro #49.
+    # The bug fires when the body filter sees a single chain link with
+    # last_buf=1 carrying more than ZSTD_CStreamInSize (131072) bytes;
+    # default output_buffers (2 32k) split the file into ~32 KiB chain
+    # links, masking the truncation. With one 1 MiB output buffer + sendfile
+    # the whole file flows through as a single in_file chain link.
+    extra_directives = (
+        "http2 on; output_buffers 1 1m; sendfile on; aio off;"
+    )
     stop_nginx()
     render_template(
-        extra_directives="http2 on;",
+        extra_directives=extra_directives,
         extra_server=EXTRA_SERVER_TLS,
         load_modules=load_modules,
     )
