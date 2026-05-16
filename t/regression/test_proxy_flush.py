@@ -33,7 +33,7 @@ import requests
 
 from conftest import CONF_PATH, render_template, start_nginx, stop_nginx
 
-FIXTURE_PORT = 9000
+FIXTURE_PORT = 9003  # distinct from test_filter_eligibility (9000), test_websocket (9001), test_http2_proxy_flush (9002), test_infinite_loop (9004)
 NGINX_URL = "http://127.0.0.1:8080"
 
 # Each handler writes the bytes it sent into this dict so the test can
@@ -169,35 +169,35 @@ def upstream_fixture() -> Iterator[None]:
         sock.close()
 
 
-EXTRA_LOCATIONS = """
+EXTRA_LOCATIONS = f"""
     # Sub-test chunked-on: proxy_buffering on (default).
-    location /chunked-on/ {
-        proxy_pass http://127.0.0.1:9000/chunked;
+    location /chunked-on/ {{
+        proxy_pass http://127.0.0.1:{FIXTURE_PORT}/chunked;
         proxy_http_version 1.1;
-    }
+    }}
     # Sub-test chunked-off: proxy_buffering off, chunks reach filter with
     # b->flush=1 each.
-    location /chunked-off/ {
-        proxy_pass http://127.0.0.1:9000/chunked;
+    location /chunked-off/ {{
+        proxy_pass http://127.0.0.1:{FIXTURE_PORT}/chunked;
         proxy_http_version 1.1;
         proxy_buffering off;
-    }
+    }}
     # Sub-test sse: same flush-per-event pattern but no Content-Length.
-    location /sse/ {
-        proxy_pass http://127.0.0.1:9000/sse;
+    location /sse/ {{
+        proxy_pass http://127.0.0.1:{FIXTURE_PORT}/sse;
         proxy_http_version 1.1;
         proxy_buffering off;
         proxy_read_timeout 30s;
-    }
+    }}
     # Sub-test upgrade: WebSocket stand-in headers; upstream returns
     # buffered body (real WebSocket framing is V2).
-    location /upgrade/ {
-        proxy_pass http://127.0.0.1:9000/upgrade;
+    location /upgrade/ {{
+        proxy_pass http://127.0.0.1:{FIXTURE_PORT}/upgrade;
         proxy_http_version 1.1;
         proxy_set_header Connection "Upgrade";
         proxy_set_header Upgrade websocket;
         proxy_buffering off;
-    }
+    }}
 """
 
 
