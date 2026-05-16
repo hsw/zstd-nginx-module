@@ -9,5 +9,5 @@
 pytest>=8.0,<9
 requests>=2.32,<3
 httpx[http2]>=0.27,<0.30   # [http2] pulls in h2 + hpack + hyperframe
-zstandard>=0.22,<0.24
+zstandard>=0.22,<0.26       # 0.25 ships cp314 wheels (Ubuntu 26.04 has python3.14)
 websockets>=12.0,<14

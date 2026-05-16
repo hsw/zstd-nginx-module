@@ -148,6 +148,7 @@ run_variant() {
     docker exec "$cid" sh -c "sed \
         -e 's|__LOAD_MODULES__|${render_load}|' \
         -e 's|__EXTRA_DIRECTIVES__|${render_extra}|' \
+        -e 's|__EXTRA_SERVER__||' \
         -e 's|__EXTRA_LOCATIONS__||' \
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf"
@@ -202,7 +203,7 @@ run_variant() {
     local pytest_log="${var_log_dir}/pytest.log"
     local junit_xml="${var_log_dir}/pytest-junit.xml"
     echo "  -> ${variant} :: pytest"
-    if docker exec "$cid" bash -c "cd /opt/regression && python3 -m pytest -v --tb=short --color=no -p no:cacheprovider --junitxml=/tmp/pytest-junit.xml 2>&1" \
+    if docker exec "$cid" bash -c "cd /opt/regression && python3 -u -m pytest -v --tb=short --color=no -p no:cacheprovider --junitxml=/tmp/pytest-junit.xml 2>&1" \
             > "$pytest_log" 2>&1; then
         SUMMARY_LINES+=("${variant}/pytest: pass")
         variant_inc_pass "$variant"
