@@ -66,6 +66,7 @@ RUN cd /usr/local/src/nginx && \
       --with-cc-opt="-O0 -g -fprofile-arcs -ftest-coverage -DNGX_DEBUG_PALLOC=1 -Wno-error" \
       --with-ld-opt="-lgcov" \
       --with-http_ssl_module \
+      --with-http_v2_module \
       --add-module=/src \
       2>&1 | tail -10 && \
     make -j"$(nproc)" 2>&1 | tail -5 && \

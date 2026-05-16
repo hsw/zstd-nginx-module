@@ -71,6 +71,7 @@ RUN cd /usr/local/src/nginx && \
       --modules-path=/etc/nginx/modules \
       --with-cc-opt="-O0 -g -fno-omit-frame-pointer -Wno-error" \
       --with-http_ssl_module \
+      --with-http_v2_module \
       --add-module=/src \
       2>&1 | tail -10 && \
     make -j"$(nproc)" 2>&1 | tail -5 && \
