@@ -23,7 +23,7 @@ IMAGE="zstd-nginx-asan:latest"
 CNAME="zstd-asan-$$"
 PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
 PORT="${ZSTD_TEST_PORT:-8080}"
-LOG_DIR="${REPO_ROOT}/t/asan-logs"
+LOG_DIR="${REPO_ROOT}/tmp/asan-logs"
 mkdir -p "$LOG_DIR"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -78,43 +78,33 @@ trap cleanup EXIT
 # RSS noise per cycle to blow past the 512 KiB threshold even when the CDict
 # cleanup hook is wired up correctly. Leak coverage of the dict path lives in
 # valgrind.sh instead.
-SCRIPTS=(
-    accept-encoding.sh
-    h2-truncation.sh
-    head-parity.sh
-    infinite-loop.sh
-    new-directives.sh
-)
+# All regression scripts have been ported to pytest (test_*.py). filter-
+# priority.sh stays as bash because it's brotli-only (not built into the
+# asan image). dict-reload runs only via t/run.sh (master/worker model
+# incompatible with single-process foreground forced here).
 
 overall_rc=0
-for script in "${SCRIPTS[@]}"; do
-    log="${LOG_DIR}/${script}.log"
-    echo "==> asan :: ${script}"
-    # See Dockerfile.asan ENV block for rationale.
-    # Sanitizer abort-on-error rationale: with abort_on_error=1 + halt_on_error=1
-    # the very first finding aborts the worker, which (in single-process mode
-    # set below) takes the listener with it — curl gets a connection error and
-    # the regression script's `nginx -t` / nginx start path bails immediately.
-    # This is the desired behaviour: a finding becomes a HARD test failure
-    # rather than a stderr line the driver might miss with a soft grep. The
-    # earlier `exitcode=0:halt_on_error=0` policy made findings advisory, which
-    # missed UBSan reports under stderr-eating daemonize.
-    #
-    # detect_leaks=0 stays because the nginx cycle pool ("free everything on
-    # exit") looks like a leak to ASan but isn't a defect.
-    if docker exec \
-            -e ZSTD_REGRESSION_NO_DAEMON=1 \
-            -e ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1:strict_string_checks=1:check_initialization_order=1:print_stacktrace=1" \
-            -e UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1:suppressions=/etc/ubsan.supp" \
-            "$cid" bash "/opt/regression/${script}" \
-            > "$log" 2>&1; then
-        echo "  pass  ${script} (log: t/asan-logs/${script}.log)"
-    else
-        rc=$?
-        echo "  fail  ${script} rc=${rc} (log: t/asan-logs/${script}.log)"
-        overall_rc=1
-    fi
-done
+
+# Pytest pass: same sanitizer envs as the bash loop above. JUnit XML is
+# written to t/asan-logs/pytest-junit.xml for CI-side parsing; the human-
+# readable per-test output lands in t/asan-logs/pytest.log. -p no:cacheprovider
+# avoids the EROFS noise from the read-only /opt/regression mount.
+echo "==> asan :: pytest"
+pytest_log="${LOG_DIR}/pytest.log"
+junit_xml="${LOG_DIR}/pytest-junit.xml"
+if docker exec \
+        -e ZSTD_REGRESSION_NO_DAEMON=1 \
+        -e ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:halt_on_error=1:strict_string_checks=1:check_initialization_order=1:print_stacktrace=1" \
+        -e UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1:abort_on_error=1:suppressions=/etc/ubsan.supp" \
+        "$cid" bash -c "cd /opt/regression && python3 -m pytest -v --tb=short --color=no -p no:cacheprovider --junitxml=/tmp/pytest-junit.xml 2>&1" \
+        > "$pytest_log" 2>&1; then
+    echo "  pass  pytest (log: t/asan-logs/pytest.log)"
+else
+    rc=$?
+    echo "  fail  pytest rc=${rc} (log: t/asan-logs/pytest.log)"
+    overall_rc=1
+fi
+docker cp "$cid:/tmp/pytest-junit.xml" "$junit_xml" >/dev/null 2>&1 || true
 
 # Scan regression stderr for ASan/UBSan markers. We deliberately filter out
 # the two well-known nginx-core noise sources:
@@ -149,7 +139,8 @@ fi
 
 echo
 echo "=== asan summary ==="
-echo "  regression scripts: ${SCRIPTS[*]}"
+echo "  runner: pytest (test_*.py under /opt/regression)"
 echo "  log dir:            ${LOG_DIR}/"
+echo "  junit xml:          ${LOG_DIR}/pytest-junit.xml"
 
 exit "$overall_rc"

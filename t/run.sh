@@ -11,17 +11,13 @@
 #   2. Run the baseline liveness probe (GET / → 200 "ok").
 #   3. Stop nginx inside the container so individual regression scripts can
 #      re-render the config and bring nginx up themselves.
-#   4. Execute every t/regression/*.sh inside the container via `docker exec`,
-#      skipping scripts that don't apply to the current variant.
+#   4. Execute pytest (test_*.py) inside the container via `docker exec`.
+#      test_filter_priority self-skips on non-brotli builds; other modules
+#      run on every variant.
 #   5. Stop the container.
 #
-# Applicability gating:
-#   * `filter-priority.sh` only runs on the brotli-enabled variant.
-#   * Other scripts run on every variant.
-#
-# The driver keeps running after a script failure so all failures are visible
-# in one pass. Exit code is 0 iff every selected variant passes every applicable
-# script.
+# The driver keeps running after a pytest failure so all variants are visible
+# in one pass. Exit code is 0 iff every selected variant's pytest passes.
 #
 # Per-script log directory (default tmp/run/<variant>/<script>.log). Override
 # with $ZSTD_RUN_LOG_DIR.
@@ -33,9 +29,6 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
-
-# shellcheck disable=SC1091
-source "$REPO_ROOT/t/regression/_common.sh"
 
 ALL_VARIANTS=(
     ubuntu-22.04
@@ -56,27 +49,6 @@ export ZSTD_TEST_PORT
 
 LOG_DIR="${ZSTD_RUN_LOG_DIR:-${REPO_ROOT}/tmp/run}"
 mkdir -p "$LOG_DIR"
-
-# Discover regression scripts (bash 3.2 compatible — no `mapfile`, no
-# `find -printf`).
-REG_SCRIPTS=()
-for f in "$REPO_ROOT"/t/regression/*.sh; do
-    name="$(basename "$f")"
-    [ "$name" = "_common.sh" ] && continue
-    REG_SCRIPTS+=("$name")
-done
-
-script_applies() {
-    local script="$1" variant="$2"
-    case "$script" in
-        filter-priority.sh)
-            [ "$variant" = "ubuntu-24.04-brotli" ]
-            ;;
-        *)
-            return 0
-            ;;
-    esac
-}
 
 # Per-variant aggregate counters kept as parallel arrays (bash 3.2 has no
 # associative arrays). variant_index() returns the slot for a given variant.
@@ -223,25 +195,25 @@ run_variant() {
         sleep 0.1
     done
 
-    for script in ${REG_SCRIPTS[@]+"${REG_SCRIPTS[@]}"}; do
-        if ! script_applies "$script" "$variant"; then
-            SUMMARY_LINES+=("${variant}/${script}: skip")
-            continue
-        fi
-        local log="${var_log_dir}/${script}.log"
-        echo "  -> ${variant} :: ${script}"
-        if docker exec "$cid" bash "/opt/regression/${script}" \
-                > "$log" 2>&1; then
-            SUMMARY_LINES+=("${variant}/${script}: pass")
-            variant_inc_pass "$variant"
-        else
-            SUMMARY_LINES+=("${variant}/${script}: fail (log: ${log#${REPO_ROOT}/})")
-            variant_inc_fail "$variant"
-            echo "     --- tail ${log#${REPO_ROOT}/} ---"
-            tail -n 30 "$log" | sed 's/^/     /'
-            echo "     --- end tail ---"
-        fi
-    done
+    # Pytest is the single regression runner since the bash scripts were
+    # ported. JUnit XML is written per variant so CI can pick up per-variant
+    # results. test_filter_priority.py self-skips on non-brotli builds via
+    # `nginx -V | grep ngx_brotli`.
+    local pytest_log="${var_log_dir}/pytest.log"
+    local junit_xml="${var_log_dir}/pytest-junit.xml"
+    echo "  -> ${variant} :: pytest"
+    if docker exec "$cid" bash -c "cd /opt/regression && python3 -m pytest -v --tb=short --color=no -p no:cacheprovider --junitxml=/tmp/pytest-junit.xml 2>&1" \
+            > "$pytest_log" 2>&1; then
+        SUMMARY_LINES+=("${variant}/pytest: pass")
+        variant_inc_pass "$variant"
+    else
+        SUMMARY_LINES+=("${variant}/pytest: fail (log: ${pytest_log#${REPO_ROOT}/})")
+        variant_inc_fail "$variant"
+        echo "     --- tail ${pytest_log#${REPO_ROOT}/} ---"
+        tail -n 40 "$pytest_log" | sed 's/^/     /'
+        echo "     --- end tail ---"
+    fi
+    docker cp "$cid:/tmp/pytest-junit.xml" "$junit_xml" >/dev/null 2>&1 || true
 
     docker stop "$cid" >/dev/null 2>&1 || true
 }

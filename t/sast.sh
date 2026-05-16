@@ -2,7 +2,7 @@
 # sast.sh — host-side driver for the SAST docker variant.
 #
 # Builds `zstd-nginx-sast` if missing, then runs the in-container dispatcher.
-# Output lands in t/sast-results/ on the host (bind-mounted).
+# Output lands in tmp/sast-results/ on the host (bind-mounted).
 #
 # Usage:
 #   bash t/sast.sh                  # build + run all 5 tools
@@ -32,7 +32,7 @@ esac
 
 IMAGE="zstd-nginx-sast:latest"
 PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
-RESULTS_DIR="${REPO_ROOT}/t/sast-results"
+RESULTS_DIR="${REPO_ROOT}/tmp/sast-results"
 mkdir -p "$RESULTS_DIR"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -47,7 +47,7 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     }
 fi
 
-echo "==> running SAST tool '${TOOL}' (results -> t/sast-results/)"
+echo "==> running SAST tool '${TOOL}' (results -> tmp/sast-results/)"
 docker run --rm \
     --platform "$PLATFORM" \
     -v "${RESULTS_DIR}:/work/sast-results" \

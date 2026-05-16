@@ -23,7 +23,7 @@ IMAGE="zstd-nginx-valgrind:latest"
 CNAME="zstd-valgrind-$$"
 PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
 PORT="${ZSTD_TEST_PORT:-8080}"
-LOG_DIR="${REPO_ROOT}/t/valgrind-logs"
+LOG_DIR="${REPO_ROOT}/tmp/valgrind-logs"
 mkdir -p "$LOG_DIR"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -92,34 +92,26 @@ exec valgrind \
 EOF
 chmod +x /usr/sbin/nginx'
 
-# Regression subset. accept-encoding exercises the compression hot-path under
-# memcheck and is the highest-leverage script for catching real leaks in the
-# per-request path. dict-reload is excluded — its core assertion is "master
-# RSS does not grow across N nginx -s reload cycles", which is incompatible
-# with the single-process-foreground mode we force under valgrind (no master,
-# so SIGHUP semantics differ and the reload loop never completes).
-SCRIPTS=(accept-encoding.sh)
-
+# All regression scripts ported to pytest. Valgrind keeps a tight subset
+# (test_accept_encoding.py) because each test starts/stops nginx and
+# valgrind's ~50× slowdown would make the full suite take 30+ minutes.
+# accept-encoding exercises the compression hot-path enough to surface
+# per-request leaks; the rest is covered by coverage/asan harnesses.
 overall_rc=0
-for script in "${SCRIPTS[@]}"; do
-    log="${LOG_DIR}/${script}.log"
-    echo "==> valgrind :: ${script}"
-    # ZSTD_REGRESSION_NO_DAEMON=1 keeps nginx in foreground + single-process
-    # mode under valgrind. The default daemonize path double-forks the worker
-    # away from the valgrind-traced master, so the request hot-path runs
-    # OUTSIDE memcheck. See _common.sh::apply_daemon_mode for what that flag
-    # actually flips.
-    if docker exec \
-            -e ZSTD_REGRESSION_NO_DAEMON=1 \
-            "$cid" bash "/opt/regression/${script}" \
-            > "$log" 2>&1; then
-        echo "  pass  ${script} (log: t/valgrind-logs/${script}.log)"
-    else
-        rc=$?
-        echo "  fail  ${script} rc=${rc} (log: t/valgrind-logs/${script}.log)"
-        overall_rc=1
-    fi
-done
+echo "==> valgrind :: pytest (test_accept_encoding.py)"
+pytest_log="${LOG_DIR}/pytest.log"
+junit_xml="${LOG_DIR}/pytest-junit.xml"
+if docker exec \
+        -e ZSTD_REGRESSION_NO_DAEMON=1 \
+        "$cid" bash -c "cd /opt/regression && python3 -m pytest test_accept_encoding.py -v --tb=short --color=no -p no:cacheprovider --junitxml=/tmp/pytest-junit.xml 2>&1" \
+        > "$pytest_log" 2>&1; then
+    echo "  pass  pytest (log: t/valgrind-logs/pytest.log)"
+else
+    rc=$?
+    echo "  fail  pytest rc=${rc} (log: t/valgrind-logs/pytest.log)"
+    overall_rc=1
+fi
+docker cp "$cid:/tmp/pytest-junit.xml" "$junit_xml" >/dev/null 2>&1 || true
 
 # Pull valgrind logs out of the container. They were written via --log-file=
 # above, one per nginx pid. Grep for actionable findings.

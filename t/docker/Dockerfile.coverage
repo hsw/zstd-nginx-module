@@ -1,0 +1,92 @@
+# Dockerfile.coverage — gcov-instrumented nginx + zstd module build.
+#
+# Static build with -fprofile-arcs -ftest-coverage so every executed line/branch
+# in filter/ and static/ is recorded in .gcda files at process exit. The
+# regression suite is run inside the container by t/coverage.sh; the driver
+# then invokes gcov on the .c files and surfaces uncovered lines/branches.
+#
+# Design notes:
+#   * -O0: gcov's branch-coverage accuracy collapses under -O1+ (the compiler
+#     elides arcs and rewrites them). Optimised builds would underreport.
+#   * Static build (not dynamic .so): with a dynamic module, .gcda files would
+#     materialise in the module's build directory but not be discoverable by
+#     gcov when run from the static-build path. Static keeps everything in one
+#     place (/usr/local/src/nginx/objs/addon/*/*.gcda).
+#   * GCOV_PREFIX_STRIP=0 + default __gcov_init: .gcda files land next to the
+#     .gcno emitted at compile time, which is /usr/local/src/nginx/objs/addon/.
+#   * `nginx -s quit` (or stop) calls exit() in the worker, which triggers
+#     __gcov_exit() and flushes .gcda. SIGKILL would skip the flush — every
+#     regression script already uses graceful shutdown via stop_local_nginx.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+        gcc lcov \
+        libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
+        make \
+        curl ca-certificates \
+        gnupg lsb-release \
+        bash python3 python3-pytest python3-requests python3-zstandard python3-websockets zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update \
+ && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx \
+ && rm -f /tmp/nginx.tar.gz
+
+COPY config /src/config
+COPY filter /src/filter
+COPY static /src/static
+
+# Instrumented static build. We point --add-module at /src so the module's
+# top-level config script registers both filter/ and static/. The .gcno files
+# (compile-time block graph) and .gcda files (run-time hit counts) end up in
+# /usr/local/src/nginx/objs/addon/{filter,static}/.
+RUN cd /usr/local/src/nginx && \
+    ./configure \
+      --prefix=/usr \
+      --conf-path=/etc/nginx/nginx.conf \
+      --sbin-path=/usr/sbin/nginx \
+      --pid-path=/tmp/nginx.pid \
+      --error-log-path=/var/log/nginx/error.log \
+      --http-log-path=/var/log/nginx/access.log \
+      --modules-path=/etc/nginx/modules \
+      --with-cc-opt="-O0 -g -fprofile-arcs -ftest-coverage -DNGX_DEBUG_PALLOC=1 -Wno-error" \
+      --with-ld-opt="-lgcov" \
+      --with-http_ssl_module \
+      --add-module=/src \
+      2>&1 | tail -10 && \
+    make -j"$(nproc)" 2>&1 | tail -5 && \
+    install -m 0755 objs/nginx /usr/sbin/nginx && \
+    /usr/sbin/nginx -V 2>&1 | tail -5
+
+RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi /var/log/nginx
+
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+RUN sed \
+        -e 's|__LOAD_MODULES__||' \
+        -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+# The .gcno files are placed in objs/addon/ at compile time. Make them
+# world-writable so .gcda dumps from the unprivileged nginx user work.
+RUN chmod -R 0777 /usr/local/src/nginx/objs
+
+EXPOSE 8080
+CMD ["/usr/sbin/nginx"]

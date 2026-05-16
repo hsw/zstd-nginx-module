@@ -5,7 +5,7 @@
 #   scan-build | clang-tidy | cppcheck | gcc-fanalyzer | flawfinder | all | summary
 #
 # Each tool writes its raw output to /work/sast-results/<tool>.log (mounted
-# from the host as t/sast-results/). The host driver `t/sast.sh` is the
+# from the host as tmp/sast-results/). The host driver `t/sast.sh` is the
 # convenient entry point; this script is only invoked inside the SAST image.
 #
 # Adapted from nginx-ssl-fingerprint's run-sast.sh:
