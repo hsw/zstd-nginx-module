@@ -19,7 +19,7 @@ RUN apt-get update \
  && apt-get install -y \
         curl ca-certificates gnupg lsb-release \
         build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev libbrotli-dev \
-        zstd python3 python3-pytest python3-requests python3-zstandard python3-websockets wget pkg-config git cmake g++ \
+        zstd python3 python3-venv python3-pip wget pkg-config git cmake g++ \
  && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
  && CODENAME=$(lsb_release -cs) \
  && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
@@ -61,6 +61,14 @@ RUN /src/zstd-nginx-module/t/docker/build-module.sh \
 RUN mkdir -p /etc/nginx /etc/nginx/modules /var/log/nginx /var/cache/nginx \
              /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi
 
+# Pinned Python test deps in a venv — placed after nginx build so test-dep
+# changes don't invalidate the build cache. See Dockerfile.dynamic.
+COPY t/docker/requirements.txt /opt/requirements.txt
+RUN python3 -m venv /opt/test-venv \
+ && /opt/test-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/test-venv/bin/pip install --no-cache-dir -r /opt/requirements.txt
+ENV PATH=/opt/test-venv/bin:$PATH
+
 COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
 COPY t/regression /opt/regression
 
@@ -69,6 +77,7 @@ COPY t/regression /opt/regression
 RUN sed \
         -e 's|__LOAD_MODULES__||' \
         -e 's|__EXTRA_DIRECTIVES__|brotli on; brotli_min_length 0; brotli_types *;|' \
+        -e 's|__EXTRA_SERVER__||' \
         -e 's|__EXTRA_LOCATIONS__||' \
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf

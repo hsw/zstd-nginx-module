@@ -41,6 +41,7 @@ def _nginx_has_compat() -> bool:
 def render_template(
     extra_directives: str = "",
     extra_locations: str = "",
+    extra_server: str = "",
     load_modules: str | None = None,
 ) -> None:
     """Render the nginx.conf.template into /etc/nginx/nginx.conf.
@@ -48,6 +49,11 @@ def render_template(
     Only standalone marker lines are substituted — marker mentions in the
     template's comment block stay intact. This mirrors render_nginx_template
     in t/regression/_common.sh.
+
+    extra_server is server-scope content (e.g. extra `listen 8443 ssl;` +
+    ssl_certificate directives) injected just inside the server block,
+    before the location definitions. Used by HTTP/2 tests that need a TLS
+    listener so httpx can negotiate h2 via ALPN.
     """
     if load_modules is None:
         load_modules = (
@@ -68,6 +74,9 @@ def render_template(
         elif s == "__EXTRA_DIRECTIVES__":
             if extra_directives:
                 out_lines.append(extra_directives + "\n")
+        elif s == "__EXTRA_SERVER__":
+            if extra_server:
+                out_lines.append(extra_server + "\n")
         elif s == "__EXTRA_LOCATIONS__":
             if extra_locations:
                 out_lines.append(extra_locations + "\n")

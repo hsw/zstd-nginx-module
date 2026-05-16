@@ -5,6 +5,10 @@
 #                          or a blank line for static builds.
 #   __EXTRA_DIRECTIVES__   regression-test-specific http-context directives
 #                          (e.g. zstd_window_bits, zstd_bypass) injected per script.
+#   __EXTRA_SERVER__       server-context directives (e.g. extra `listen` lines,
+#                          ssl_certificate / ssl_certificate_key) injected per
+#                          script before the location blocks. Used by HTTP/2
+#                          tests that need a `listen 8443 ssl;` companion socket.
 #   __EXTRA_LOCATIONS__    extra server-context location blocks for regression
 #                          fixtures that need bespoke handlers (default: empty).
 #   __SERVER_PORT__        listen port for the test server (default 8080).
@@ -51,6 +55,8 @@ http {
     server {
         listen __SERVER_PORT__;
         server_name _;
+
+        __EXTRA_SERVER__
 
         # Baseline liveness probe — used by t/run.sh baseline.
         location = / {
