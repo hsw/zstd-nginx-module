@@ -310,32 +310,85 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
 }
 
 
+static ngx_uint_t
+ngx_http_zstd_quantity(u_char *p, u_char *last)
+{
+    u_char      c;
+    ngx_uint_t  n, q;
+
+    /*
+     * Parse RFC 9110 §5.3.1 q-value: "0", "0.0[0[0]]", "1", "1.0[0[0]]".
+     * Returns the quantity scaled to 0..100 (q=1 → 100, q=0 → 0, q=0.5 → 50).
+     * Returns 0 for syntactic rejects too — caller treats both q=0 and
+     * invalid q as "decline this coding". Duplicate of the filter module's
+     * helper (same name there); factoring into a shared header is V2.
+     */
+
+    c = *p++;
+    if (c != '0' && c != '1') {
+        return 0;
+    }
+
+    q = (c - '0') * 100;
+    if (p == last) {
+        return q;
+    }
+
+    c = *p++;
+    if (c == ',' || c == ' ' || c == '\t') {
+        return q;
+    }
+    if (c != '.') {
+        return 0;
+    }
+
+    n = 0;
+    while (p < last) {
+        c = *p++;
+        if (c == ',' || c == ' ' || c == '\t') {
+            break;
+        }
+        if (c >= '0' && c <= '9') {
+            q += c - '0';
+            n++;
+            continue;
+        }
+        return 0;
+    }
+
+    if (q > 100 || n > 3) {
+        return 0;
+    }
+
+    return q;
+}
+
+
 static ngx_int_t
 ngx_http_zstd_accept_encoding(ngx_str_t *ae)
 {
-    u_char  *p, *end;
+    u_char  *p, *end, *q;
 
     /*
-     * Bounded stop-char check: locate a case-insensitive "zstd" token whose
-     * neighbours are token separators (comma, semicolon, whitespace) or
-     * string boundaries. This rejects "zstdx", "zstd-future", "xzstd", etc.
+     * Bounded RFC 9110-compliant Accept-Encoding parser. Mirrors the
+     * filter module's parser shape: locates each "zstd" token candidate,
+     * validates token boundaries, and rejects `;q=0` explicitly.
      *
-     * DIVERGENCE FROM FILTER PARSER (intentional, V1): the filter module's
-     * ngx_http_zstd_accept_encoding() (filter/ngx_http_zstd_filter_module.c,
-     * Task 5) additionally honours `;q=0` as an explicit reject per RFC 9110.
-     * This static-module check does NOT parse q-values — for a precompressed
-     * `.zst` file the static handler conservatively serves it whenever the
-     * client's Accept-Encoding mentions "zstd" at all, regardless of q-value.
-     * Rationale: the static module is a cache-hit fast path; clients sending
-     * `zstd;q=0` are vanishingly rare and the perf/complexity tradeoff favours
-     * the simpler check here. Revisit in V2 if the divergence causes user-
-     * visible issues; factoring a shared helper is explicitly deferred.
+     * Why this isn't a no-q-value fast path anymore: codex review of the
+     * fix/ae-parser branch (2026-05-16) flagged the V1 divergence as a
+     * real RFC violation — `zstd_static on` mode has a plain fallback, so
+     * the perf-savings argument doesn't hold. `ngx_http_zstd_quantity` is
+     * duplicated from the filter for now; shared header factoring is V2.
+     *
+     * Loop on q=0 instead of returning DECLINED: a header like
+     * `zstd;q=0, zstd` (unusual but RFC-valid) must accept the second
+     * token. The outer loop advances past the comma after a q=0 reject.
      */
 
     end = ae->data + ae->len;
     p = ae->data;
 
-    while (p < end) {
+    for ( ;; ) {
         p = ngx_strcasestrn(p, "zstd", sizeof("zstd") - 1 - 1);
         if (p == NULL) {
             return NGX_DECLINED;
@@ -344,20 +397,47 @@ ngx_http_zstd_accept_encoding(ngx_str_t *ae)
         if (p == ae->data
             || *(p - 1) == ',' || *(p - 1) == ' ' || *(p - 1) == '\t')
         {
-            u_char  *q = p + (sizeof("zstd") - 1);
+            q = p + (sizeof("zstd") - 1);
 
-            if (q == end
-                || *q == ',' || *q == ';'
-                || *q == ' ' || *q == '\t')
-            {
+            if (q == end || *q == ',' || *q == ' ' || *q == '\t') {
+                return NGX_OK;
+            }
+
+            if (*q == ';') {
+                q++;
+                while (q < end && (*q == ' ' || *q == '\t')) {
+                    q++;
+                }
+                if (q < end && (*q == 'q' || *q == 'Q')) {
+                    q++;
+                    while (q < end && (*q == ' ' || *q == '\t')) {
+                        q++;
+                    }
+                    if (q < end && *q == '=') {
+                        q++;
+                        while (q < end && (*q == ' ' || *q == '\t')) {
+                            q++;
+                        }
+                        if (q < end && ngx_http_zstd_quantity(q, end) == 0) {
+                            /* explicit q=0 (or invalid) — try next token */
+                            while (q < end && *q != ',') {
+                                q++;
+                            }
+                            p = (q < end) ? q + 1 : end;
+                            if (p >= end) {
+                                return NGX_DECLINED;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                /* `;` without `q=0` (e.g. `;foo=bar` or `;q=0.5`) → accept */
                 return NGX_OK;
             }
         }
 
         p += sizeof("zstd") - 1;
     }
-
-    return NGX_DECLINED;
 }
 
 
