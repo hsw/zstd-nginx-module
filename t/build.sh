@@ -27,6 +27,12 @@ ALL_VARIANTS=(
     ubuntu-26.04
     ubuntu-24.04-brotli
 )
+# angie-{22.04,24.04,26.04} variants exist as on-demand targets in the
+# case-dispatch below — built explicitly via `bash t/build.sh angie-24.04`
+# or similar. Excluded from ALL_VARIANTS because they reproduce the same
+# bug signature as the matching ubuntu-NN.NN variant (nginx-core 1.29.3
+# code path, inherited unchanged by angie 1.11.5) — adding them to the
+# default matrix doubles CI cost for zero unique signal.
 
 if [ "$#" -gt 0 ]; then
     VARIANTS=("$@")
@@ -61,6 +67,18 @@ for v in "${VARIANTS[@]}"; do
         ubuntu-24.04-brotli)
             dockerfile="t/docker/Dockerfile.brotli"
             build_args=(--build-arg UBUNTU_VERSION=24.04)
+            ;;
+        angie-22.04)
+            dockerfile="t/docker/Dockerfile.angie"
+            build_args=(--build-arg UBUNTU_VERSION=22.04)
+            ;;
+        angie-24.04)
+            dockerfile="t/docker/Dockerfile.angie"
+            build_args=(--build-arg UBUNTU_VERSION=24.04)
+            ;;
+        angie-26.04)
+            dockerfile="t/docker/Dockerfile.angie"
+            build_args=(--build-arg UBUNTU_VERSION=26.04)
             ;;
         *)
             echo "build.sh: unknown variant '${v}'" >&2
