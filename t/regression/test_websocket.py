@@ -123,36 +123,36 @@ def test_websocket_through_zstd_filter(nginx_with_ws):
 
     On master baseline this is the Stensel8 production scenario; if the
     Upgrade response gets caught by zstd's body_filter (filter activated
-    on the 101 response's zero-byte body, sentinel-buf path), the worker
-    can freeze and the handshake never completes."""
+    on the 101 response's zero-body, sentinel-buf path), the worker
+    can freeze and the handshake never completes.
+
+    Uses `asyncio.wait_for` (not `asyncio.timeout`) for Python 3.10
+    compat — the venv runs the same code on 22.04 (py3.10), 24.04
+    (py3.12), and 26.04 (py3.13).
+    """
     url = nginx_with_ws.replace("http://", "ws://") + "/ws/"
 
-    async def run_client():
-        # Apply a hard timeout to the whole conversation — freeze symptom
-        # is "client never sees frames", which an async timeout catches.
-        async with asyncio.timeout(5):
-            async with websockets.connect(url) as ws:
-                # 1. Server-pushed initial message (independent of echo).
-                first = await ws.recv()
-                assert first == "hello-from-upstream", (
-                    f"unexpected server greeting: {first!r}"
-                )
+    async def conversation():
+        async with websockets.connect(url) as ws:
+            # 1. Server-pushed initial message (independent of echo).
+            first = await ws.recv()
+            assert first == "hello-from-upstream", (
+                f"unexpected server greeting: {first!r}"
+            )
+            # 2. Send 4 messages, expect 4 echoes back. Each "echo: X"
+            # roundtrip exercises both client→server frame parsing
+            # and server→client frame emission through nginx.
+            sent_msgs = ["msg-1", "msg-2", "msg-3", "msg-4"]
+            received = []
+            for m in sent_msgs:
+                await ws.send(m)
+                reply = await ws.recv()
+                received.append(reply)
+            assert received == [f"echo: {m}" for m in sent_msgs], (
+                f"echo roundtrip mismatch: sent={sent_msgs} received={received}"
+            )
 
-                # 2. Send 4 messages, expect 4 echoes back. Each "echo: X"
-                # roundtrip exercises both client→server frame parsing
-                # and server→client frame emission through nginx.
-                sent_msgs = ["msg-1", "msg-2", "msg-3", "msg-4"]
-                received = []
-                for m in sent_msgs:
-                    await ws.send(m)
-                    reply = await ws.recv()
-                    received.append(reply)
-
-                assert received == [f"echo: {m}" for m in sent_msgs], (
-                    f"echo roundtrip mismatch: sent={sent_msgs} received={received}"
-                )
-
-    asyncio.run(run_client())
+    asyncio.run(asyncio.wait_for(conversation(), timeout=5))
 
 
 def test_websocket_handshake_speed(nginx_with_ws):
@@ -162,17 +162,14 @@ def test_websocket_handshake_speed(nginx_with_ws):
     full echo test above."""
     url = nginx_with_ws.replace("http://", "ws://") + "/ws/"
 
-    async def run():
+    async def measure():
         start = time.monotonic()
-        async with asyncio.timeout(3):
-            async with websockets.connect(url) as ws:
-                handshake_ms = (time.monotonic() - start) * 1000.0
-                # Close immediately — we only care about how fast the
-                # 101 response came back.
-                await ws.close()
+        async with websockets.connect(url) as ws:
+            handshake_ms = (time.monotonic() - start) * 1000.0
+            await ws.close()
         return handshake_ms
 
-    elapsed_ms = asyncio.run(run())
+    elapsed_ms = asyncio.run(asyncio.wait_for(measure(), timeout=3))
     assert elapsed_ms < 1000, (
         f"WebSocket handshake took {elapsed_ms:.0f}ms — flush-promotion "
         f"gap on the 101 Switching Protocols response (zero-body) "
