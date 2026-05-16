@@ -1,0 +1,62 @@
+# valgrind.supp — Valgrind suppressions for the in-container nginx + zstd build.
+#
+# Filters out the standard "free everything when the process dies" nginx-core
+# init-pool allocations that are not defects but show up as `definitely lost`.
+# Anything not suppressed here is either a real defect in our zstd module or a
+# real defect in nginx core we should care about.
+#
+# Curated empirically: each stanza below was observed firing in the
+# t/valgrind-logs/raw/*.log output of a full t/valgrind.sh run against the
+# current Dockerfile.valgrind build (gcc -O0 -g, glibc 2.39, valgrind 3.22).
+# Donor-project leftovers from nginx-ssl-fingerprint (OpenSSL noise, libc
+# res_n*, epoll_pwait variants etc.) were dropped — they never matched any
+# leak/error in our run logs.
+
+# Init cycle pool — allocated at startup (main → ngx_init_cycle) and never
+# freed because nginx assumes process-exit reclaims OS memory. Same pattern
+# whether we run nginx -t (single shot) or as a server (foreground).
+{
+   nginx_init_cycle_pool_create_main
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:posix_memalign
+   fun:ngx_memalign
+   fun:ngx_create_pool
+   fun:ngx_init_cycle
+   fun:main
+}
+
+# Bootstrap log/conf pool — allocated by main() directly at nginx.c:254 before
+# ngx_init_cycle takes over. Distinct from the cycle pool above; same "free
+# on process exit" pattern.
+{
+   nginx_bootstrap_pool_create_main
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:posix_memalign
+   fun:ngx_memalign
+   fun:ngx_create_pool
+   fun:main
+}
+
+# Worker init: posted-event queue allocations + environment strdup, all kept
+# alive for the lifetime of the process. ngx_event_process_init and
+# ngx_set_environment are nginx-core, not our module.
+{
+   nginx_event_process_init_alloc
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+   ...
+}
+{
+   nginx_set_environment_alloc
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_set_environment
+   ...
+}

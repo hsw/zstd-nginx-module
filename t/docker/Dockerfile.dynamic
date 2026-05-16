@@ -1,0 +1,93 @@
+# Dockerfile.dynamic — single-stage dynamic-module build against nginx.org
+# mainline. Replaces the per-version Dockerfile.ubuntu-{22,24,26}.04 files —
+# the only build-time difference between them was the FROM tag, so parameter-
+# ising over UBUNTU_VERSION removes 3 near-duplicate files.
+#
+# Build context expected to be the repo root (see t/build.sh).
+# nginx is installed from the official nginx.org mainline apt repo
+# (https://nginx.org/en/linux_packages.html) so we test against a known
+# upstream version rather than Ubuntu's distro patchset. The matching source
+# tarball is downloaded from https://nginx.org/download/ to compile the module
+# .so against ABI-identical headers.
+#
+# Build args:
+#   UBUNTU_VERSION  ubuntu base image tag (e.g. 22.04, 24.04, 26.04).
+#   VARIANT         "default" (no extra steps) or "shared-only" (removes
+#                   libzstd.a* after install to prove dynamic-first
+#                   detection works — see filter/config / static/config).
+#
+# We unconditionally install libpcre2-dev (not libpcre3-dev). nginx 1.21.5+
+# auto-detects PCRE2 when libpcre.h is absent. PCRE1 is upstream-EOL (2021)
+# and 26.04 dropped libpcre3-dev entirely, so PCRE2 is the only choice that
+# works across all supported bases.
+#
+# Single-stage on purpose: this is a test image, not a distributable
+# artifact, so we don't bother stripping build-essential from the final
+# layer. Paying twice for `apt-get install nginx` (once per stage) cost
+# more cold-build time than the resulting size savings were worth.
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG VARIANT=default
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates gnupg lsb-release \
+        build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
+        zstd python3 wget pkg-config \
+ && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+# shared-only fixture: delete libzstd.a* after install so configure must rely
+# on libzstd.so. We can't use `find -prune -delete` (GNU find forces -depth
+# under -delete, which silently turns -prune into a no-op).
+RUN if [ "$VARIANT" = "shared-only" ]; then \
+        rm -f /usr/lib/x86_64-linux-gnu/libzstd.a* /usr/lib/libzstd.a* && \
+        if ls /usr/lib/x86_64-linux-gnu/libzstd.a* /usr/lib/libzstd.a* 2>/dev/null; then \
+            echo "shared-only fixture: libzstd.a survived deletion" >&2; exit 1; \
+        fi; \
+    fi
+
+# Match nginx source to installed mainline version. nginx -v prints to stderr
+# in the form "nginx version: nginx/1.27.3" — we strip everything around the
+# version triplet and fetch the matching tarball from nginx.org.
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx \
+ && rm -f /tmp/nginx.tar.gz
+
+# Point COPYs: only files needed to compile the module. Editing README,
+# docs, or unrelated scripts won't invalidate this layer.
+COPY config /src/config
+COPY filter /src/filter
+COPY static /src/static
+COPY t/docker/build-module.sh /src/t/docker/build-module.sh
+RUN /src/t/docker/build-module.sh /usr/local/src/nginx /src dynamic \
+ && mkdir -p /etc/nginx/modules \
+ && cp /usr/local/src/nginx/objs/*.so /etc/nginx/modules/
+
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+# Render a default nginx.conf so the baseline `CMD ["nginx"]` works without
+# an external entrypoint. Regression scripts re-render the template at test
+# time against /etc/nginx/templates/nginx.conf.template.
+RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi \
+ && sed \
+        -e 's|__LOAD_MODULES__|load_module modules/ngx_http_zstd_filter_module.so;|' \
+        -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+CMD ["nginx"]
