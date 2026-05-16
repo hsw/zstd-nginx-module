@@ -40,7 +40,14 @@ else
     VARIANTS=("${ALL_VARIANTS[@]}")
 fi
 
-PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
+# Empty = let docker pick the host's native architecture (M1/M2/M3 → arm64,
+# x86_64 Linux runners → amd64, etc). Set ZSTD_TEST_PLATFORM=linux/amd64 in
+# CI when production-parity arch is required even on arm64 runners.
+PLATFORM="${ZSTD_TEST_PLATFORM:-}"
+# Conditional --platform flag: emits nothing when PLATFORM is empty,
+# so docker uses native. Avoids "--platform=" empty-value issues.
+PLATFORM_FLAG=()
+[ -n "$PLATFORM" ] && PLATFORM_FLAG=(--platform "$PLATFORM")
 
 declare -a OK_LIST FAIL_LIST
 OK_LIST=()
@@ -94,9 +101,9 @@ for v in "${VARIANTS[@]}"; do
     fi
 
     image="zstd-nginx-test:${v}"
-    echo "==> building ${image} from ${dockerfile} (--platform ${PLATFORM} ${build_args[*]})"
+    echo "==> building ${image} from ${dockerfile} (platform=${PLATFORM:-native} ${build_args[*]})"
     if docker build \
-            --platform "$PLATFORM" \
+            ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
             "${build_args[@]}" \
             -t "$image" \
             -f "$dockerfile" \
