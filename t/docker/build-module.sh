@@ -71,10 +71,12 @@ if [ "$MODE" = "dynamic" ]; then
         CONFIGURE_ARGS+=(--add-dynamic-module="$extra")
     done
 else
-    # static build pulls in http_ssl so a realistic nginx is produced; the
-    # gzip filter is on by default so filter/config's filter-priority sed can
-    # exercise brotli > zstd > gzip ordering at link time.
-    CONFIGURE_ARGS+=(--with-http_ssl_module --add-module="$MODULE_SRC")
+    # static build pulls in http_ssl + http_v2 so a realistic nginx is
+    # produced; the gzip filter is on by default so filter/config's
+    # filter-priority sed can exercise brotli > zstd > gzip ordering at
+    # link time. http_v2 makes the brotli variant usable by pytest
+    # test_h2_truncation / test_http2_proxy_flush (they skip otherwise).
+    CONFIGURE_ARGS+=(--with-http_ssl_module --with-http_v2_module --add-module="$MODULE_SRC")
     for extra in "$@"; do
         CONFIGURE_ARGS+=(--add-module="$extra")
     done

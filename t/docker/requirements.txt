@@ -1,0 +1,13 @@
+# Pinned Python test deps for the zstd-nginx-module regression suite.
+# Installed into a venv at /opt/test-venv inside every Dockerfile.* image so
+# we get uniform versions across Ubuntu 22.04 (python3.10) / 24.04 (3.12) /
+# 26.04 (3.13+) and across the ASan / valgrind / coverage variants.
+#
+# Lower bounds chosen for the feature surface we use; upper bounds chosen to
+# avoid surprise major bumps.
+
+pytest>=8.0,<9
+requests>=2.32,<3
+httpx[http2]>=0.27,<0.30   # [http2] pulls in h2 + hpack + hyperframe
+zstandard>=0.22,<0.24
+websockets>=12.0,<14

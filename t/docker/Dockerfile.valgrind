@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
         make \
         curl ca-certificates \
         gnupg lsb-release \
-        bash python3 python3-pytest python3-requests python3-zstandard python3-websockets zstd \
+        bash python3 python3-venv python3-pip zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin to nginx.org mainline via the apt package, then fetch matching tarball.
@@ -71,6 +71,7 @@ RUN cd /usr/local/src/nginx && \
       --modules-path=/etc/nginx/modules \
       --with-cc-opt="-O0 -g -fno-omit-frame-pointer -Wno-error" \
       --with-http_ssl_module \
+      --with-http_v2_module \
       --add-module=/src \
       2>&1 | tail -10 && \
     make -j"$(nproc)" 2>&1 | tail -5 && \
@@ -78,6 +79,21 @@ RUN cd /usr/local/src/nginx && \
     /usr/sbin/nginx -V 2>&1
 
 RUN mkdir -p /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi /var/log/nginx
+
+# Pinned Python test deps in a venv — placed after nginx build so test-dep
+# changes don't invalidate the build cache.
+COPY t/docker/requirements.txt /opt/requirements.txt
+RUN python3 -m venv /opt/test-venv \
+ && /opt/test-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/test-venv/bin/pip install --no-cache-dir -r /opt/requirements.txt
+ENV PATH=/opt/test-venv/bin:$PATH
+
+# Self-signed cert for HTTP/2 tests (httpx 0.28 needs TLS+ALPN for h2).
+RUN openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout /etc/nginx/test-key.pem \
+        -out /etc/nginx/test-cert.pem \
+        -days 3650 -subj "/CN=test" 2>/dev/null \
+ && chmod 0644 /etc/nginx/test-key.pem /etc/nginx/test-cert.pem
 
 COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
 COPY t/docker/valgrind.supp /etc/valgrind.supp
@@ -88,6 +104,7 @@ COPY t/regression /opt/regression
 RUN sed \
         -e 's|__LOAD_MODULES__||' \
         -e 's|__EXTRA_DIRECTIVES__||' \
+        -e 's|__EXTRA_SERVER__||' \
         -e 's|__EXTRA_LOCATIONS__||' \
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
