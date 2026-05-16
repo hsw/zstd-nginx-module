@@ -52,3 +52,18 @@ Mkfile.old
 dkms.conf
 
 t/servroot/*
+
+# pytest + Python bytecode
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Test harness runtime output — all drivers write under tmp/
+tmp/
+
+# Local working notes (decisions, drafts, comparison reports, etc.).
+# Anything under docs/ is for the working copy only — not shared via git.
+docs/
+
+# macOS
+.DS_Store
