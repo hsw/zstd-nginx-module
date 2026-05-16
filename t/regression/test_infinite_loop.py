@@ -5,9 +5,9 @@ bytes then closes, the original filter spun forever (worker CPU 100%). Fix:
 break out on EOF before declared length.
 
 Coverage:
-  1. python TCP fixture on :9000 sends Content-Length: 16385 but only
+  1. python TCP fixture on :9004 sends Content-Length: 16385 but only
      16384 bytes of body, then closes (1-byte short read).
-  2. nginx proxies /shortread/ → :9000 with proxy_buffering off (so short-read
+  2. nginx proxies /shortread/ → :9004 with proxy_buffering off (so short-read
      flows straight into the body filter).
   3. curl with Accept-Encoding: zstd + --max-time 5 must return within 8s.
   4. Worker CPU jiffies over 2s after the request must stay near zero
@@ -35,6 +35,7 @@ from conftest import (
 )
 
 PID_PATH = Path("/tmp/nginx.pid")
+FIXTURE_PORT = 9004  # distinct from test_filter_eligibility (9000), test_websocket (9001), test_http2_proxy_flush (9002), test_proxy_flush (9003)
 
 
 def _start_short_read_fixture() -> threading.Thread:
@@ -68,7 +69,7 @@ def _start_short_read_fixture() -> threading.Thread:
 
     s = socket.socket()
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", 9000))
+    s.bind(("127.0.0.1", FIXTURE_PORT))
     s.listen(8)
 
     def loop():
@@ -99,13 +100,13 @@ def loop_nginx():
     # already defines /shortread/ with default buffering — can't override (would
     # be "duplicate location"). Use a separate path /shortread/ with the
     # required buffering-off setting.
-    extra_locations = """
-        location /shortread/ {
-            proxy_pass http://127.0.0.1:9000/;
+    extra_locations = f"""
+        location /shortread/ {{
+            proxy_pass http://127.0.0.1:{FIXTURE_PORT}/;
             proxy_http_version 1.1;
             proxy_set_header Host $host;
             proxy_buffering off;
-        }
+        }}
 """
     stop_nginx()
     render_template(extra_locations=extra_locations, load_modules=load_modules)
