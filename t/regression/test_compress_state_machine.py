@@ -29,10 +29,10 @@ from pathlib import Path
 from typing import Iterator
 
 import pytest
-import requests
 
 from conftest import (
     BASE_URL,
+    http_request,
     render_template,
     start_nginx,
     stop_nginx,
@@ -127,11 +127,10 @@ BASIC_CASES = [
 @pytest.mark.parametrize("case", BASIC_CASES, ids=[c.label for c in BASIC_CASES])
 def test_state_machine_basic(nginx_state_machine, case: BasicCase, tmp_path):
     """Hit one of the configured locations under HTTP/1.1, decode response
-    body, byte-compare against expected payload."""
-    r = requests.get(
-        nginx_state_machine + case.path,
-        headers={"Accept-Encoding": "zstd"},
-        timeout=15,
+    body, byte-compare against expected payload. Uses conftest.http_request
+    so we read the raw zstd frame off the wire (not urllib3-decoded)."""
+    r, body = http_request(
+        nginx_state_machine, case.path, accept_encoding="zstd", timeout=15,
     )
     assert r.status_code == 200, (
         f"[{case.label}] status={r.status_code}, headers={dict(r.headers)}"
@@ -140,7 +139,13 @@ def test_state_machine_basic(nginx_state_machine, case: BasicCase, tmp_path):
         f"[{case.label}] Content-Encoding={r.headers.get('Content-Encoding')!r}, "
         f"expected zstd"
     )
-    decoded = _decompress(r.content, tmp_path, case.label)
+    # Empty body case: a zero-byte 200 still emits a valid zstd frame
+    # (just header + footer). It must NOT be a literal empty body — that
+    # would mean the filter skipped compression entirely.
+    assert body[:4] == b"\x28\xb5\x2f\xfd", (
+        f"[{case.label}] body missing zstd magic; hex={body[:16].hex()}"
+    )
+    decoded = _decompress(body, tmp_path, case.label)
     if isinstance(case.expect, Path):
         expect_bytes = case.expect.read_bytes()
     else:
@@ -162,15 +167,13 @@ def test_state_machine_disk_vs_proxy(nginx_state_machine, tmp_path):
     src = Path("/var/fixtures/random/equiv.css").read_bytes()
 
     def fetch_decompress(path: str) -> bytes:
-        r = requests.get(
-            nginx_state_machine + path,
-            headers={"Accept-Encoding": "zstd"},
-            timeout=15,
+        r, body = http_request(
+            nginx_state_machine, path, accept_encoding="zstd", timeout=15,
         )
         assert r.headers.get("Content-Encoding") == "zstd", (
             f"path={path} Content-Encoding={r.headers.get('Content-Encoding')!r}"
         )
-        return _decompress(r.content, tmp_path, path.replace("/", "_"))
+        return _decompress(body, tmp_path, path.replace("/", "_"))
 
     disk = fetch_decompress("/random/equiv.css")
     proxy = fetch_decompress("/equiv-proxy/")
@@ -218,7 +221,11 @@ def test_parallel_burst(nginx_state_machine, tmp_path):
     """20 concurrent connections, mixed body sizes. Exercises re-entrancy
     of the state machine init/teardown across requests in the same worker.
     Uses ThreadPoolExecutor with 20 workers — each gets its own connection,
-    so the worker process handles 20 simultaneous compression contexts."""
+    so the worker process handles 20 simultaneous compression contexts.
+
+    Uses conftest.http_request (raw bytes via stream + decode_content=False)
+    so each thread compares against the on-the-wire zstd frame, not
+    urllib3-decoded content."""
     urls = [
         "/random/131072",
         "/random/200000",
@@ -227,20 +234,22 @@ def test_parallel_burst(nginx_state_machine, tmp_path):
     ]
 
     def fetch(i: int) -> tuple[int, str | None]:
-        url = nginx_state_machine + urls[i % 4]
+        path = urls[i % 4]
         try:
-            r = requests.get(
-                url, headers={"Accept-Encoding": "zstd"}, timeout=30
+            r, body = http_request(
+                nginx_state_machine, path, accept_encoding="zstd", timeout=30,
             )
-        except requests.RequestException as e:
+        except Exception as e:
             return i, f"request-exception: {e}"
         if r.status_code != 200:
             return i, f"status={r.status_code}"
         if r.headers.get("Content-Encoding") != "zstd":
             return i, f"ce={r.headers.get('Content-Encoding')!r}"
+        if body[:4] != b"\x28\xb5\x2f\xfd":
+            return i, f"missing zstd magic; hex={body[:16].hex()}"
         # Decompress on a per-thread temp file to avoid contention.
         zst = tmp_path / f"burst-{i}.zst"
-        zst.write_bytes(r.content)
+        zst.write_bytes(body)
         rc = subprocess.run(
             ["zstd", "-dc", str(zst)], capture_output=True, check=False
         )

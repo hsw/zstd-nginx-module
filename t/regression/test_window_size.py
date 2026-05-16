@@ -27,7 +27,7 @@ from __future__ import annotations
 import re
 import subprocess
 
-import requests
+from conftest import http_request
 
 BROWSER_LIMIT_BYTES = 8 * 1024 * 1024  # 8 MiB = 2^23
 
@@ -49,25 +49,27 @@ def test_window_size_default_browser_safe(nginx, tmp_path):
     """The default-configured filter must produce a response whose frame
     header reports Window Size <= 8 MiB (Chrome's hard limit). Today's
     module default is windowLog=19 (512 KiB), so this is a regression net
-    against any future change to a browser-hostile default."""
-    # /text is a 180-byte text/plain body served by the baseline template;
-    # plenty of body for the encoder to commit to a real window size.
-    # (Tiny bodies < frame block size could produce a degenerate window.)
-    r = requests.get(
-        nginx + "/text",
-        headers={"Accept-Encoding": "zstd"},
-        timeout=5,
-    )
+    against any future change to a browser-hostile default.
+
+    Uses conftest.http_request to bypass urllib3's auto-decompression
+    (python3-zstandard installed system-wide on Ubuntu 24.04+) — we must
+    inspect the on-the-wire frame bytes, not the decoded plaintext."""
+    # /text is a 180-byte text/plain body served by the baseline template.
+    r, body = http_request(nginx, "/text", accept_encoding="zstd")
     assert r.headers.get("Content-Encoding") == "zstd", (
         f"expected Content-Encoding=zstd, got {r.headers.get('Content-Encoding')!r}"
     )
+    assert body[:4] == b"\x28\xb5\x2f\xfd", (
+        f"body does not start with zstd magic 28b52ffd; first 16B hex="
+        f"{body[:16].hex()} — urllib3 auto-decode bypass failed?"
+    )
     zst_path = tmp_path / "response.zst"
-    zst_path.write_bytes(r.content)
+    zst_path.write_bytes(body)
 
     bytes_ = _window_bytes(str(zst_path))
     assert bytes_ is not None, (
-        f"could not parse `zstd --list -v` output; stdout was empty or "
-        f"unexpected format. Response was {len(r.content)} compressed bytes."
+        f"could not parse `zstd --list -v` output; "
+        f"response was {len(body)} compressed bytes."
     )
     assert bytes_ <= BROWSER_LIMIT_BYTES, (
         f"window={bytes_}B exceeds Chrome 8 MiB limit ({BROWSER_LIMIT_BYTES}B) — "

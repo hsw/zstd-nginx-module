@@ -246,15 +246,27 @@ CASES = [
 
 @pytest.mark.parametrize("case", CASES, ids=[c.label for c in CASES])
 def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
-    """Issue a single upstream-driven request, decompress, byte-compare
-    against the truth bytes recorded by the fixture handler. If max_ttfb_ms
-    > 0, also assert time_starttransfer is below it."""
+    """Issue a single upstream-driven request, byte-compare the decoded
+    response against ground truth recorded by the fixture handler.
+
+    Reads the raw zstd frame off the wire via `r.raw.stream(decode_content
+    =False)` — bypassing urllib3's auto-zstd decoder (registered because
+    python3-zstandard is installed system-wide on Ubuntu 24.04+). If we
+    let urllib3 decode, we'd be comparing decoded plaintext against truth,
+    losing the assertion that the response is actually a valid zstd frame
+    (and not, e.g., uncompressed because Content-Encoding negotiation
+    silently failed).
+
+    TTFB measurement: time from request start to first raw-zstd byte
+    arriving via the streaming reader. Production bug ("Stensel8 freeze")
+    manifests as TTFB ≈ total upstream window (no progressive flush);
+    healthy filter has TTFB ≈ first-chunk-arrival (~200 ms).
+    """
+    import subprocess
     url = nginx_with_proxy_locations + case.path
     start = time.monotonic()
-    # requests doesn't expose curl's `time_starttransfer` directly; we use
-    # the elapsed time at which the first body byte arrives via stream=True
-    # + iter_content. iter_content reads from the underlying connection,
-    # so the first non-empty chunk timing is our TTFB.
+    # Explicit Accept-Encoding: zstd, no auto-decode. stream=True returns
+    # immediately after headers — body is read lazily via r.raw.stream.
     r = requests.get(
         url,
         headers={"Accept-Encoding": "zstd"},
@@ -263,22 +275,28 @@ def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
     )
     ttfb_ms: float | None = None
     body = bytearray()
-    for chunk in r.iter_content(chunk_size=1024):
-        if chunk:
-            if ttfb_ms is None:
-                ttfb_ms = (time.monotonic() - start) * 1000.0
-            body.extend(chunk)
+    try:
+        # r.raw is the underlying urllib3 HTTPResponse. .stream() yields
+        # raw bytes off the connection with decode_content controllable.
+        for chunk in r.raw.stream(amt=4096, decode_content=False):
+            if chunk:
+                if ttfb_ms is None:
+                    ttfb_ms = (time.monotonic() - start) * 1000.0
+                body.extend(chunk)
+    finally:
+        r.close()
     total_ms = (time.monotonic() - start) * 1000.0
 
     assert r.headers.get("Content-Encoding") == "zstd", (
         f"[{case.label}] Content-Encoding={r.headers.get('Content-Encoding')!r}, "
         f"expected zstd"
     )
+    assert bytes(body[:4]) == b"\x28\xb5\x2f\xfd", (
+        f"[{case.label}] response missing zstd magic; hex={bytes(body[:16]).hex()} "
+        f"(decode_content=False bypass should have given raw frame bytes)"
+    )
 
-    # Decompress and byte-compare against the truth bytes recorded by the
-    # fixture handler. zstandard library is preferred but not in the
-    # docker image — shell out to `zstd -d`.
-    import subprocess
+    # Decompress and byte-compare against the upstream truth bytes.
     zst_path = tmp_path / f"{case.label}.zst"
     zst_path.write_bytes(bytes(body))
     dec = subprocess.run(
