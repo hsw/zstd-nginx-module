@@ -37,7 +37,7 @@ RUN apt-get update \
  && apt-get install -y \
         curl ca-certificates gnupg lsb-release \
         build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev \
-        zstd python3 wget pkg-config \
+        zstd python3 python3-pytest python3-requests python3-zstandard python3-websockets wget pkg-config \
  && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
  && CODENAME=$(lsb_release -cs) \
  && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \

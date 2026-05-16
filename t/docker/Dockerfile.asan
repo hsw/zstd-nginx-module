@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
         make \
         curl ca-certificates \
         gnupg lsb-release \
-        bash python3 zstd \
+        bash python3 python3-pytest python3-requests python3-zstandard python3-websockets zstd \
     && rm -rf /var/lib/apt/lists/* \
     && ln -s /usr/bin/clang-18 /usr/local/bin/clang \
     && ln -s /usr/bin/clang++-18 /usr/local/bin/clang++ \
