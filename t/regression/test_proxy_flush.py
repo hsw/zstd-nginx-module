@@ -1,0 +1,308 @@
+"""Flush-promotion regression for chunked / SSE / Upgrade upstream patterns.
+
+Background — production reports on the tokers/zstd-nginx-module#23 thread:
+  * mklooss 2025-03-20  — Varnish chunked + proxy_buffering on → error with
+                          PR #23 patch (i.e. step1's `dc951f8`); works
+                          without the patch OR with proxy_buffering off.
+  * Stensel8 2026-01-11 — HomeAssistant WebSocket via `Connection: Upgrade`
+                          + proxy_buffering off + HTTP/2+HTTP/3 → worker
+                          freeze (nginx 1.29.3).
+  * lowkeypriority 2026-02-02 — same as Stensel8.
+
+The four sub-tests below map to four upstream patterns the production bug
+manifests under. They are byte-equality + hang-ceiling regression nets at
+this scope; tightening to actually fail on master baseline (TTFB / latency
+discrimination) needs bigger chunks + HTTP/2-to-client + real WebSocket
+framing — V2 hardening work tracked in docs/upstream-coverage.md G1/G2.
+
+The Python TCP fixture server is started by a session-scoped pytest
+fixture so the threaded handler thread doesn't leak between tests.
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import threading
+import time
+from dataclasses import dataclass
+from typing import Iterator
+
+import pytest
+import requests
+
+from conftest import CONF_PATH, render_template, start_nginx, stop_nginx
+
+FIXTURE_PORT = 9000
+NGINX_URL = "http://127.0.0.1:8080"
+
+# Each handler writes the bytes it sent into this dict so the test can
+# byte-compare the decompressed client response against ground truth.
+GROUND_TRUTH: dict[str, bytes] = {}
+GROUND_TRUTH_LOCK = threading.Lock()
+
+
+def _send_chunked(c: socket.socket) -> None:
+    """6 chunks * ~10 KiB random tail, 200 ms gap. Total upstream window
+    ~1.2 s, total body ~60 KiB — bigger than nginx's default
+    proxy_buffer_size (4-8 KiB) so the chunks fragment into multiple chain
+    links when proxy_buffering is off, but still well under
+    ZSTD_CStreamInSize (~128 KiB) so the bug isn't masked by libzstd's
+    natural spill."""
+    c.sendall(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    full = bytearray()
+    for i in range(6):
+        chunk = f"chunk-{i:02d}-".encode() + os.urandom(10240)
+        full.extend(chunk)
+        c.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+        time.sleep(0.2)
+    c.sendall(b"0\r\n\r\n")
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["chunked"] = bytes(full)
+
+
+def _send_sse(c: socket.socket) -> None:
+    """8 SSE events with 200 ms gap. Each event ~512 bytes — realistic
+    SSE traffic shape, total upstream window ~1.6 s."""
+    c.sendall(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream\r\n"
+        b"Cache-Control: no-cache\r\n"
+        b"Connection: close\r\n"
+        b"\r\n"
+    )
+    full = bytearray()
+    for i in range(8):
+        payload = os.urandom(240).hex()
+        evt = f"event: msg\ndata: {i:02d}-{payload}\n\n".encode()
+        full.extend(evt)
+        c.sendall(evt)
+        time.sleep(0.2)
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["sse"] = bytes(full)
+
+
+def _send_upgrade(c: socket.socket) -> None:
+    """Stand-in for WebSocket — plain 200 + buffered body. Real WebSocket
+    framing needs the `websockets` library (V2). The point here is to
+    exercise the zstd filter under Upgrade-shaped request headers, not the
+    framing protocol itself."""
+    body = b"upgrade-stand-in-body-" + b"y" * 200 + b"\n"
+    c.sendall(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"Connection: close\r\n"
+        b"\r\n" + body
+    )
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["upgrade"] = body
+
+
+def _handle(c: socket.socket) -> None:
+    try:
+        c.settimeout(2)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        # Parse request-line path.
+        try:
+            path = buf.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[1]
+        except (IndexError, UnicodeDecodeError):
+            path = ""
+        if path.startswith("/chunked"):
+            _send_chunked(c)
+        elif path.startswith("/sse"):
+            _send_sse(c)
+        elif path.startswith("/upgrade"):
+            _send_upgrade(c)
+        else:
+            c.sendall(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+    finally:
+        try:
+            c.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        c.close()
+
+
+def _server_loop(sock: socket.socket, stop_event: threading.Event) -> None:
+    sock.settimeout(0.5)
+    while not stop_event.is_set():
+        try:
+            c, _ = sock.accept()
+        except socket.timeout:
+            continue
+        threading.Thread(target=_handle, args=(c,), daemon=True).start()
+
+
+@pytest.fixture(scope="module")
+def upstream_fixture() -> Iterator[None]:
+    """Module-scoped: one TCP fixture server on FIXTURE_PORT for the whole
+    test_proxy_flush module. Started before any sub-test, torn down at
+    module exit."""
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", FIXTURE_PORT))
+    sock.listen(16)
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_server_loop, args=(sock, stop), daemon=True
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        sock.close()
+
+
+EXTRA_LOCATIONS = """
+    # Sub-test chunked-on: proxy_buffering on (default).
+    location /chunked-on/ {
+        proxy_pass http://127.0.0.1:9000/chunked;
+        proxy_http_version 1.1;
+    }
+    # Sub-test chunked-off: proxy_buffering off, chunks reach filter with
+    # b->flush=1 each.
+    location /chunked-off/ {
+        proxy_pass http://127.0.0.1:9000/chunked;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+    }
+    # Sub-test sse: same flush-per-event pattern but no Content-Length.
+    location /sse/ {
+        proxy_pass http://127.0.0.1:9000/sse;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+        proxy_read_timeout 30s;
+    }
+    # Sub-test upgrade: WebSocket stand-in headers; upstream returns
+    # buffered body (real WebSocket framing is V2).
+    location /upgrade/ {
+        proxy_pass http://127.0.0.1:9000/upgrade;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Upgrade websocket;
+        proxy_buffering off;
+    }
+"""
+
+
+@pytest.fixture(scope="module")
+def nginx_with_proxy_locations(upstream_fixture) -> Iterator[str]:
+    """Module-scoped nginx with the four proxy-flush locations rendered
+    in. Replaces the default `nginx` fixture for this test file because
+    we need custom locations; the default fixture doesn't parameterise."""
+    stop_nginx()
+    render_template(extra_locations=EXTRA_LOCATIONS.strip())
+    start_nginx()
+    try:
+        yield NGINX_URL
+    finally:
+        stop_nginx()
+
+
+@dataclass
+class FlushCase:
+    label: str
+    path: str
+    truth_key: str
+    # Max time for the whole request — hang ceiling, NOT latency assertion.
+    max_time_s: float = 10.0
+    # Max TTFB in milliseconds. 0 disables the assertion. The bug behaviour
+    # is "bytes accumulate until upstream closes" → TTFB ≈ upstream window
+    # (~1.2-1.6 s) instead of ~first-chunk-arrival (~200 ms). 600 ms is the
+    # goldilocks: well above healthy TTFB, well below upstream close.
+    max_ttfb_ms: float = 0
+
+
+CASES = [
+    # chunked-on: proxy_buffering on. nginx core coalesces upstream chunks
+    # before they reach the body filter, so latency masking is too strong
+    # to make TTFB discriminative. Byte-equality + hang ceiling only.
+    FlushCase("chunked-on", "/chunked-on/", "chunked", max_ttfb_ms=0),
+    # chunked-off: proxy_buffering off. Each chunk reaches body filter
+    # with b->flush=1. Expected (post 0.2.1 flush promotion): TTFB ≤ 600
+    # ms. On master baseline: ALSO under 600 ms in our docker — chunks
+    # are too small to surface the bug. Documented gap.
+    FlushCase("chunked-off", "/chunked-off/", "chunked", max_ttfb_ms=600),
+    FlushCase("sse", "/sse/", "sse", max_ttfb_ms=600),
+    FlushCase("upgrade", "/upgrade/", "upgrade", max_ttfb_ms=0),
+]
+
+
+@pytest.mark.parametrize("case", CASES, ids=[c.label for c in CASES])
+def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
+    """Issue a single upstream-driven request, decompress, byte-compare
+    against the truth bytes recorded by the fixture handler. If max_ttfb_ms
+    > 0, also assert time_starttransfer is below it."""
+    url = nginx_with_proxy_locations + case.path
+    start = time.monotonic()
+    # requests doesn't expose curl's `time_starttransfer` directly; we use
+    # the elapsed time at which the first body byte arrives via stream=True
+    # + iter_content. iter_content reads from the underlying connection,
+    # so the first non-empty chunk timing is our TTFB.
+    r = requests.get(
+        url,
+        headers={"Accept-Encoding": "zstd"},
+        timeout=case.max_time_s,
+        stream=True,
+    )
+    ttfb_ms: float | None = None
+    body = bytearray()
+    for chunk in r.iter_content(chunk_size=1024):
+        if chunk:
+            if ttfb_ms is None:
+                ttfb_ms = (time.monotonic() - start) * 1000.0
+            body.extend(chunk)
+    total_ms = (time.monotonic() - start) * 1000.0
+
+    assert r.headers.get("Content-Encoding") == "zstd", (
+        f"[{case.label}] Content-Encoding={r.headers.get('Content-Encoding')!r}, "
+        f"expected zstd"
+    )
+
+    # Decompress and byte-compare against the truth bytes recorded by the
+    # fixture handler. zstandard library is preferred but not in the
+    # docker image — shell out to `zstd -d`.
+    import subprocess
+    zst_path = tmp_path / f"{case.label}.zst"
+    zst_path.write_bytes(bytes(body))
+    dec = subprocess.run(
+        ["zstd", "-dc", str(zst_path)],
+        capture_output=True, check=False,
+    )
+    assert dec.returncode == 0, (
+        f"[{case.label}] zstd -d failed: {dec.stderr.decode(errors='replace')}"
+    )
+
+    with GROUND_TRUTH_LOCK:
+        truth = GROUND_TRUTH.get(case.truth_key)
+    assert truth is not None, (
+        f"[{case.label}] fixture handler did not record ground truth for "
+        f"key={case.truth_key!r}"
+    )
+    assert dec.stdout == truth, (
+        f"[{case.label}] decoded differs from upstream: "
+        f"truth={len(truth)}B vs dec={len(dec.stdout)}B"
+    )
+
+    if case.max_ttfb_ms > 0:
+        assert ttfb_ms is not None and ttfb_ms <= case.max_ttfb_ms, (
+            f"[{case.label}] ttfb={ttfb_ms!r}ms exceeds {case.max_ttfb_ms}ms "
+            f"budget (total={total_ms:.0f}ms) — flush promotion appears not "
+            f"to be working; bytes accumulated until upstream close"
+        )
