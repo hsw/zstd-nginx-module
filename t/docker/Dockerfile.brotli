@@ -19,7 +19,7 @@ RUN apt-get update \
  && apt-get install -y \
         curl ca-certificates gnupg lsb-release \
         build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev libbrotli-dev \
-        zstd python3 python3-venv python3-pip wget pkg-config git cmake g++ \
+        zstd brotli python3 python3-venv python3-pip wget pkg-config git cmake g++ \
  && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
  && CODENAME=$(lsb_release -cs) \
  && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
@@ -68,6 +68,16 @@ RUN python3 -m venv /opt/test-venv \
  && /opt/test-venv/bin/pip install --no-cache-dir --upgrade pip \
  && /opt/test-venv/bin/pip install --no-cache-dir -r /opt/requirements.txt
 ENV PATH=/opt/test-venv/bin:$PATH
+
+# Self-signed cert for HTTP/2 tests (httpx needs TLS+ALPN for h2). Mirrors
+# the same step in Dockerfile.dynamic / Dockerfile.angie / Dockerfile.valgrind.
+# Placed before COPY t/regression so test-file churn doesn't invalidate this
+# layer (matches Dockerfile.dynamic ordering).
+RUN openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout /etc/nginx/test-key.pem \
+        -out /etc/nginx/test-cert.pem \
+        -days 3650 -subj "/CN=test" 2>/dev/null \
+ && chmod 0644 /etc/nginx/test-key.pem /etc/nginx/test-cert.pem
 
 COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
 COPY t/regression /opt/regression
