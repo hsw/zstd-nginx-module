@@ -246,9 +246,10 @@ EXTRA_LOCATIONS = f"""
     }}
     # Sub-test chunked-off-tiny: Tier-1 production-shape repro — small
     # chunks (50 × 200 B, 50 ms gap) where the action state-machine bug
-    # prevents COMPRESS → FLUSH promotion when libzstd swallows input
-    # without spilling (rc==0). xfail (strict=True) on stable HEAD;
-    # closed by commit 3 (per-call-op pattern).
+    # prevented COMPRESS → FLUSH promotion when libzstd swallowed input
+    # without spilling (rc==0). Was xfail until commit 3 retired the
+    # action state machine; now passes as a regression guard for the
+    # per-call-op refactor.
     location /chunked-off-tiny/ {{
         proxy_pass http://127.0.0.1:{FIXTURE_PORT}/chunked-tiny;
         proxy_http_version 1.1;
@@ -312,15 +313,7 @@ CASES = [
 ]
 
 
-def _case_id(c):
-    """Extract label from either a bare FlushCase or a pytest.param-wrapped one."""
-    if isinstance(c, FlushCase):
-        return c.label
-    # pytest.param: .values is the args tuple, first elem is the FlushCase
-    return c.values[0].label
-
-
-@pytest.mark.parametrize("case", CASES, ids=[_case_id(c) for c in CASES])
+@pytest.mark.parametrize("case", CASES, ids=[c.label for c in CASES])
 def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
     """Issue a single upstream-driven request, byte-compare the decoded
     response against ground truth recorded by the fixture handler.

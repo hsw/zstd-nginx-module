@@ -26,6 +26,15 @@ zstd-nginx-module - Nginx module for the [Zstandard compression](https://faceboo
 
 This Nginx module is currently considered experimental. Issues and PRs are welcome if you encounter any problems.
 
+See [CHANGELOG.md](CHANGELOG.md) for release history.
+
+## Requirements
+
+- libzstd 1.4.0 or newer. The streaming compression filter uses
+  `ZSTD_compressStream2` (introduced August 2019). Ubuntu 20.04+ and
+  Debian 11+ ship a compatible package. The static-only module
+  (`ngx_http_zstd_static_module`) does not link libzstd and is unaffected.
+
 # Synopsis
 
 ```nginx
