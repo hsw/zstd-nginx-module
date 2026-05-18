@@ -1,4 +1,4 @@
-"""Direction A — early-release workspace regression tests.
+"""Direction A -- early-release workspace regression tests.
 
 Background:
 - filter/ngx_http_zstd_filter_module.c historically pins the CStream
@@ -15,25 +15,25 @@ Why no strict-xfail TDD anchor (empirical):
 Three iterations of attempted RSS-based anchors on stable HEAD produced
 inconsistent deltas dominated by glibc's mmap heuristics:
 
-- 1st compression on a fresh worker: ΔRSS ≈ 420 KiB (lazy page-in,
+- 1st compression on a fresh worker: delta-RSS ~ 420 KiB (lazy page-in,
   many libzstd workspace pages never faulted in)
-- 2nd compression: ΔRSS ≈ 5400 KiB (glibc mmap'd a fresh region, full
+- 2nd compression: delta-RSS ~ 5400 KiB (glibc mmap'd a fresh region, full
   workspace pages resident)
-- 3rd and subsequent: ΔRSS ≈ 0 KiB (region from request 2 is reused;
+- 3rd and subsequent: delta-RSS ~ 0 KiB (region from request 2 is reused;
   pages already resident, no new heap growth)
 
 After Direction A the slow-client window would munmap the workspace chunk,
 but the visible RSS effect depends on whether glibc had mmap'd the chunk
-in the first place — a state-dependent decision. A strict assertion is
+in the first place -- a state-dependent decision. A strict assertion is
 therefore not robust in either direction on a single-request scenario.
 
 Direction A's correctness gates are owned by the existing harness:
-- ASan harness (t/asan.sh) — freeCStream-vs-pfree ordering UAF
-- Valgrind harness (t/valgrind.sh) — abort-path leak (cleanup handler)
-- test_workspace_no_fallback (this module) — ZSTD_estimateCStreamSize budget
+- ASan harness (t/asan.sh) -- freeCStream-vs-pfree ordering UAF
+- Valgrind harness (t/valgrind.sh) -- abort-path leak (cleanup handler)
+- test_workspace_no_fallback (this module) -- ZSTD_estimateCStreamSize budget
 
 Its memory effect is captured informationally in
-test_workspace_memory_observed (this module) — run with `pytest -s` to
+test_workspace_memory_observed (this module) -- run with `pytest -s` to
 emit the before/after numbers for the commit message.
 
 The win shape Direction A targets is observable in production traffic
@@ -108,7 +108,7 @@ def _ensure_compressible_body() -> Path:
 @pytest.fixture(scope="module")
 def workspace_nginx():
     """Module-scoped nginx with zstd_comp_level 6 (largest workspace in
-    the default test matrix configuration — ~5.5 MB per ZSTD_estimateCStreamSize)
+    the default test matrix configuration -- ~5.5 MB per ZSTD_estimateCStreamSize)
     and a /workspace/ location aliased to a 1 MB compressible fixture body."""
     _ensure_compressible_body()
     stop_nginx()
@@ -150,20 +150,18 @@ def test_workspace_compression_smoke(workspace_nginx):
     )
 
 
-
-
 def test_workspace_memory_observed(workspace_nginx):
     """Informational: capture worker memory metrics across the request
     lifecycle for both fast-drain and slow-client paths.
 
-    NOT an anchor — no strict assertion on deltas. Used to produce
+    NOT an anchor -- no strict assertion on deltas. Used to produce
     numerical evidence in the Direction A commit message body. Run with
     `pytest -s` to see the printed table.
 
     Three checkpoints:
       T0  pre-request baseline
       T1  during slow-client window (300 ms after sending GET, before
-          draining body — compression has completed inside nginx, ctx->done
+          draining body -- compression has completed inside nginx, ctx->done
           has flipped, but request_pool is still alive)
       T2  post fast-drain (separate request, fully read, pool destroyed)
 
@@ -171,7 +169,7 @@ def test_workspace_memory_observed(workspace_nginx):
     r->pool->large until pool destroy. T2 - T0 reflects whatever glibc
     keeps from heap-pooled small allocations.
 
-    Post-fix (Direction A): T1 - T0 should be smaller — the bump allocator's
+    Post-fix (Direction A): T1 - T0 should be smaller -- the bump allocator's
     one large preallocated chunk has been ngx_pfree'd, returning its mmap'd
     pages to the kernel. T2 - T0 should also be smaller if the chunk was
     >128 KB (always true: workspace > 530 KB at L1 and up).
@@ -202,7 +200,7 @@ def test_workspace_memory_observed(workspace_nginx):
         vsz_t1 = _proc_status_kib(worker_pid, "VmSize")
 
     # Verify T1 actually hit the compression path (otherwise the RSS
-    # sample is meaningless — workspace was never allocated, no fix to
+    # sample is meaningless -- workspace was never allocated, no fix to
     # measure). Headers-only check; the body is captured in the
     # subsequent recv() iterations we deliberately skip.
     headers_lower = buf.lower()
@@ -231,12 +229,12 @@ def test_workspace_memory_observed(workspace_nginx):
         "\n[workspace] memory metrics (KiB):\n"
         f"  T0 (baseline)         VmRSS={rss_t0:>7}  VmSize={vsz_t0:>7}\n"
         f"  T1 (slow-client mid)  VmRSS={rss_t1:>7}  VmSize={vsz_t1:>7}  "
-        f"ΔRSS={rss_t1 - rss_t0:>+7}  ΔVSZ={vsz_t1 - vsz_t0:>+7}\n"
+        f"delta-RSS={rss_t1 - rss_t0:>+7}  delta-VSZ={vsz_t1 - vsz_t0:>+7}\n"
         f"  T2 (post fast-drain)  VmRSS={rss_t2:>7}  VmSize={vsz_t2:>7}  "
-        f"ΔRSS={rss_t2 - rss_t0:>+7}  ΔVSZ={vsz_t2 - vsz_t0:>+7}\n"
+        f"delta-RSS={rss_t2 - rss_t0:>+7}  delta-VSZ={vsz_t2 - vsz_t0:>+7}\n"
     )
 
-    # Sanity only — samples succeeded, request hit the compression path.
+    # Sanity only -- samples succeeded, request hit the compression path.
     assert rss_t0 > 0 and rss_t1 > 0 and rss_t2 > 0, (
         f"VmRSS sampling failed: T0={rss_t0}, T1={rss_t1}, T2={rss_t2}"
     )
@@ -247,11 +245,10 @@ def test_workspace_no_fallback(level):
     """Sanity: ZSTD_estimateCStreamSize(level) must cover libzstd's actual
     internal allocation needs.
 
-    On stable HEAD (no Direction A) the fallback warning code path does
-    not exist, so this test is trivially GREEN. After Direction A lands,
-    this test catches regressions where a future libzstd version's
-    workspace requirement exceeds the estimate — which would force the
-    fallback `ngx_palloc(r->pool, size)` path and emit the warning.
+    After Direction A this test catches regressions where a future
+    libzstd version's workspace requirement exceeds the estimate --
+    which would force the fallback `ngx_palloc(r->pool, size)` path
+    and emit the warning.
 
     Uses an http-context error_log directive to capture WARN+ events to a
     file we can grep, since the default template logs to /dev/stderr.
@@ -259,7 +256,7 @@ def test_workspace_no_fallback(level):
     This test manages its own nginx lifecycle (stops + restarts per
     parametrize) and is declared LAST in the module so any pytest
     scheduling that runs it after workspace_nginx-using tests doesn't
-    leave the module-scoped fixture's nginx in a stopped state — module
+    leave the module-scoped fixture's nginx in a stopped state -- module
     teardown then idempotently re-stops.
     """
     log_path = Path("/tmp/zstd-workspace-test.log")
@@ -281,7 +278,7 @@ def test_workspace_no_fallback(level):
     )
     start_nginx()
     try:
-        # Compress a small static body plus the 1 MB fixture — exercises
+        # Compress a small static body plus the 1 MB fixture -- exercises
         # both single-call and multi-buf paths in the body filter.
         for path in ("/text", f"/workspace/{COMPRESSIBLE_BODY_NAME}"):
             r = requests.get(
@@ -306,7 +303,7 @@ def test_workspace_no_fallback(level):
     # `error_log` directive above.
     assert log_path.exists(), (
         f"expected error_log at {log_path}; directive did not apply or "
-        f"nginx never logged. The vacuous-pass guard caught this — fix "
+        f"nginx never logged. The vacuous-pass guard caught this -- fix "
         f"the test harness before treating fallback as 'never fires'."
     )
     log_content = log_path.read_text()

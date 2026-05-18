@@ -68,7 +68,7 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   `ngx_http_zstd_filter_create_cstream` now performs a single
   `ngx_palloc(r->pool, ZSTD_estimateCStreamSize(level) + headroom)`
   and serves libzstd's `customAlloc` callback from that chunk via a
-  bump pointer — mirroring the nginx gzip filter's allocator pattern
+  bump pointer, mirroring the nginx gzip filter's allocator pattern
   (`ngx_http_gzip_filter_module.c:615, 893`). After
   `ZSTD_freeCStream` returns in the `ctx->done` branch the workspace
   is released eagerly via `ngx_pfree(r->pool, ctx->preallocated)`;
@@ -80,8 +80,8 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   upstream error, finalize-from-another-module), the handler runs
   `ZSTD_freeCStream` on the still-alive CStream, mirroring the
   CDict cleanup pattern from `3a2c597`. Measured impact on the
-  slow-client window: ΔRSS 4148 → 416 KiB and ΔVSZ 5396 → 0 KiB
-  (≈10× reduction in workspace memory held after compression
+  slow-client window: delta-RSS 4148 -> 416 KiB and delta-VSZ 5396 -> 0 KiB
+  (~10x reduction in workspace memory held after compression
   completes). Commits: `7da62a9` (memory-observation regression
   test), `2410bba` (implementation).
 
@@ -101,7 +101,7 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 ## [Pre-0.3.0 stable]
 
 The `stable` branch carried no `CHANGELOG.md` prior to the 0.3.0 entry above.
-For history before 0.3.0 see the git log on the `stable` branch — notable
+For history before 0.3.0 see the git log on the `stable` branch -- notable
 fixes already shipped there include:
 
 - HTTP/2 silent truncation at the 131072-byte boundary (cherry-pick of upstream PR #49).

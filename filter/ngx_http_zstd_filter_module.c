@@ -16,6 +16,17 @@
 #endif
 
 
+/*
+ * Direction A: alignment-overhead headroom added to
+ * ZSTD_estimateCStreamSize(level). The bump allocator rounds each
+ * sub-allocation up to NGX_ALIGNMENT, which can cost up to
+ * (NGX_ALIGNMENT - 1) bytes per call. libzstd makes O(10)
+ * sub-allocations during CStream init; (16 * NGX_ALIGNMENT) absorbs
+ * the worst case at any platform NGX_ALIGNMENT value with margin.
+ */
+#define NGX_HTTP_ZSTD_WORKSPACE_HEADROOM  (16 * NGX_ALIGNMENT)
+
+
 typedef struct {
     ngx_str_t                    dict_file;
 } ngx_http_zstd_main_conf_t;
@@ -134,6 +145,8 @@ static ngx_int_t ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *vv, uintptr_t data);
 static void * ngx_http_zstd_filter_alloc(void *opaque, size_t size);
 static void ngx_http_zstd_filter_free(void *opaque, void *address);
+static ngx_int_t ngx_http_zstd_filter_release_workspace(ngx_http_request_t *r,
+    ngx_http_zstd_ctx_t *ctx, ZSTD_CStream *cstream, ngx_uint_t err_level);
 static char *ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data);
 static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cdict_cleanup(void *data);
@@ -287,7 +300,6 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    size_t                rv;
     ngx_int_t             flush_busy, rc;
     ngx_chain_t          *cl;
     ngx_http_zstd_ctx_t  *ctx;
@@ -394,33 +406,12 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
         flush_busy = 0;
 
         if (ctx->done) {
-            rv = ZSTD_freeCStream(ctx->cstream);
-            /*
-             * Direction A: null ctx->cstream BEFORE the pfree below so
-             * the pool-cleanup safety net handler treats this request as
-             * fast-path-done and skips a second ZSTD_freeCStream call.
-             * ZSTD_freeCStream may invoke our customFree callback during
-             * internal teardown, so the workspace pointer (ctx->preallocated)
-             * MUST remain valid until after ZSTD_freeCStream returns —
-             * that is why ngx_pfree comes after the call, not before.
-             */
-            ctx->cstream = NULL;
-            if (ZSTD_isError(rv)) {
-                ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                              "ZSTD_freeCStream() failed: %s",
-                              ZSTD_getErrorName(rv));
-
+            if (ngx_http_zstd_filter_release_workspace(r, ctx, ctx->cstream,
+                                                      NGX_LOG_ALERT)
+                != NGX_OK)
+            {
                 rc = NGX_ERROR;
             }
-
-            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "zstd: workspace released");
-
-            if (ctx->preallocated) {
-                ngx_pfree(r->pool, ctx->preallocated);
-                ctx->preallocated = NULL;
-            }
-
             return rc;
         }
     }
@@ -428,27 +419,8 @@ ngx_http_zstd_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 failed:
 
     ctx->done = 1;
-    if (ctx->cstream != NULL) {
-        rv = ZSTD_freeCStream(ctx->cstream);
-        /*
-         * Direction A: same ordering as the done branch — null cstream
-         * before pfree so the pool-cleanup safety net sees the work
-         * already done. ZSTD_freeCStream may invoke customFree during
-         * its teardown, so keep ctx->preallocated valid until after.
-         */
-        ctx->cstream = NULL;
-        if (ZSTD_isError(rv)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_freeCStream() failed: %s",
-                          ZSTD_getErrorName(rv));
-        }
-    }
-
-    if (ctx->preallocated) {
-        ngx_pfree(r->pool, ctx->preallocated);
-        ctx->preallocated = NULL;
-    }
-
+    (void) ngx_http_zstd_filter_release_workspace(r, ctx, ctx->cstream,
+                                                  NGX_LOG_ALERT);
     return NGX_ERROR;
 }
 
@@ -749,24 +721,18 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
 
     /*
      * Direction A: preallocate one chunk sized to libzstd's worst-case
-     * workspace estimate for the configured level, plus a small alignment
-     * headroom. The customAlloc shim bumps forward into this chunk with
-     * per-call NGX_ALIGNMENT padding; on done/abort the chunk is freed
-     * in one shot, returning mmap'd pages immediately to the kernel.
+     * workspace estimate for the configured level, plus
+     * NGX_HTTP_ZSTD_WORKSPACE_HEADROOM bytes for per-sub-allocation
+     * alignment overhead (see macro definition near top of file). The
+     * customAlloc shim bumps forward into this chunk; on done/abort the
+     * chunk is freed in one shot, returning mmap'd pages immediately to
+     * the kernel.
      *
      * ZSTD_estimateCStreamSize is documented as the worst-case static-
-     * arena size for ZSTD_initStaticCStream, where libzstd controls
-     * sub-allocation layout and packs without padding. Our customAlloc
-     * round-up to NGX_ALIGNMENT can consume up to (NGX_ALIGNMENT - 1)
-     * bytes per sub-allocation. libzstd makes O(10) sub-allocations
-     * during CStream init at the highest levels (observed empirically:
-     * L3 made enough to overshoot the estimate by 7 bytes during
-     * regression). 256 bytes of headroom absorbs >16 allocations at
-     * 16-byte alignment with margin to spare.
-     *
-     * The estimate can also return an error on unusual configs (e.g.
-     * extreme levels with non-default advanced params); guard with
-     * ZSTD_isError.
+     * arena size for ZSTD_initStaticCStream, where libzstd packs without
+     * padding. The estimate can return an error on unusual configs
+     * (e.g. extreme levels with non-default advanced params); guard
+     * with ZSTD_isError.
      */
     ws_size = ZSTD_estimateCStreamSize((int) zlcf->level);
     if (ZSTD_isError(ws_size)) {
@@ -775,7 +741,7 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
                       ZSTD_getErrorName(ws_size));
         return NULL;
     }
-    ws_size += 256;  /* alignment-overhead headroom (see comment above) */
+    ws_size += NGX_HTTP_ZSTD_WORKSPACE_HEADROOM;
 
     ctx->preallocated = ngx_palloc(r->pool, ws_size);
     if (ctx->preallocated == NULL) {
@@ -807,27 +773,17 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
      */
     cln = ngx_pool_cleanup_add(r->pool, 0);
     if (cln == NULL) {
-        rc = ZSTD_freeCStream(cstream);
-        if (ZSTD_isError(rc)) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "ZSTD_freeCStream() failed: %s",
-                          ZSTD_getErrorName(rc));
-        }
-        ngx_pfree(r->pool, ctx->preallocated);
-        ctx->preallocated = NULL;
+        (void) ngx_http_zstd_filter_release_workspace(r, ctx, cstream,
+                                                     NGX_LOG_ALERT);
         return NULL;
     }
     cln->handler = ngx_http_zstd_filter_cleanup;
     cln->data = ctx;
 
     /*
-     * NB: ctx->cstream is still NULL at this point — the caller assigns
-     * the return value into it. The cleanup handler checks ctx->cstream
-     * before calling ZSTD_freeCStream, so the brief window between
-     * ngx_pool_cleanup_add() and the caller's assignment is safe (any
-     * error path that triggers cleanup before assignment will see NULL
-     * and skip the free, while the create_advanced failure path above
-     * returns NULL before we even register the cleanup).
+     * ctx->cstream is still NULL here; the caller assigns the return
+     * value. The cleanup handler checks ctx->cstream != NULL, so any
+     * teardown before assignment is a no-op.
      */
 
     /*
@@ -873,34 +829,17 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
     return cstream;
 
 failed:
-    rc = ZSTD_freeCStream(cstream);
-    if (ZSTD_isError(rc)) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rc));
-    }
 
     /*
-     * Disarm the cleanup handler we already registered: cstream is now
-     * freed and ctx->cstream stays NULL (caller assigns our NULL return
-     * value), so the handler would be a no-op — but explicit disarm
-     * removes the brittle dependency on ctx->cstream observation order
-     * if the call-site contract changes (e.g. caller pre-assigns ctx->
-     * cstream = something stale). Pool cleanup with handler==NULL is
-     * defined as no-op (see src/core/ngx_palloc.c:ngx_destroy_pool).
+     * Disarm the registered cleanup handler before the helper frees
+     * cstream: handler==NULL is defined as no-op (see
+     * src/core/ngx_palloc.c:ngx_destroy_pool). Explicit disarm avoids
+     * any dependence on ctx->cstream observation order.
      */
     cln->handler = NULL;
 
-    /*
-     * Release the preallocated workspace eagerly here too — failure in
-     * init is rare but when it fires (e.g. CCtx_reset or refCDict error)
-     * the request still completes via the body_filter failed: branch,
-     * which can't reach its own ngx_pfree because ctx->preallocated has
-     * already served its purpose. Eager release returns the mmap'd pages
-     * to the kernel rather than pinning them until r->pool teardown.
-     */
-    ngx_pfree(r->pool, ctx->preallocated);
-    ctx->preallocated = NULL;
-
+    (void) ngx_http_zstd_filter_release_workspace(r, ctx, cstream,
+                                                 NGX_LOG_ALERT);
     return NULL;
 }
 
@@ -1373,22 +1312,20 @@ ngx_http_zstd_filter_init(ngx_conf_t *cf)
 static void *
 ngx_http_zstd_filter_alloc(void *opaque, size_t size)
 {
-    ngx_http_zstd_ctx_t *ctx = opaque;
-
-    void    *p;
-    size_t   aligned;
+    ngx_http_zstd_ctx_t  *ctx = opaque;
+    void                 *p;
+    size_t                aligned;
 
     /*
      * Direction A: bump allocator backed by ctx->preallocated. libzstd's
      * sub-allocations are sub-buffers of the workspace estimate; aligning
-     * each request up to NGX_ALIGNMENT (gzip filter mimic — gzip uses
-     * 8-byte alignment, our NGX_ALIGNMENT matches platform pointer size)
-     * keeps subsequent returned pointers aligned for the strictest type
-     * libzstd's internals use. If the bump exceeds the budget (libzstd
-     * version drift past ZSTD_estimateCStreamSize's promise), fall back
-     * to a pool allocation and emit a WARN so production can detect
-     * estimate drift via log analysis — test_workspace_no_fallback
-     * asserts on this log line.
+     * each request up to NGX_ALIGNMENT (gzip filter mimic, gzip uses
+     * 8-byte alignment) keeps subsequent returned pointers aligned for
+     * the strictest type libzstd's internals use. If the bump exceeds
+     * the budget (libzstd version drift past ZSTD_estimateCStreamSize's
+     * promise), fall back to a pool allocation and emit a WARN so
+     * production can detect estimate drift via log analysis;
+     * test_workspace_no_fallback asserts on this log line.
      */
     aligned = ngx_align(size, NGX_ALIGNMENT);
     if (aligned <= ctx->allocated) {
@@ -1410,7 +1347,7 @@ ngx_http_zstd_filter_alloc(void *opaque, size_t size)
     p = ngx_palloc(ctx->request->pool, size);
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, ctx->request->connection->log, 0,
-                   "zstd alloc (fallback): %p, size: %uz", p, size);
+                   "zstd alloc (fallback): %p size:%uz", p, size);
 
     return p;
 }
@@ -1485,6 +1422,49 @@ ngx_http_zstd_filter_free(void *opaque, void *address)
                    "zstd free (no-op): %p", address);
 
 #endif
+}
+
+
+static ngx_int_t
+ngx_http_zstd_filter_release_workspace(ngx_http_request_t *r,
+    ngx_http_zstd_ctx_t *ctx, ZSTD_CStream *cstream, ngx_uint_t err_level)
+{
+    size_t      rv;
+    ngx_int_t   rc;
+
+    /*
+     * Direction A teardown sequence shared by body_filter done/failed,
+     * create_cstream cleanup-add-NULL, and create_cstream failed: label.
+     *
+     * Ordering rationale: ZSTD_freeCStream may invoke our customFree
+     * callback during internal teardown, so ctx->preallocated MUST
+     * remain valid until after ZSTD_freeCStream returns. Nulling
+     * ctx->cstream BEFORE ngx_pfree lets the pool-cleanup safety net
+     * handler treat the request as fast-path-done and skip a second
+     * ZSTD_freeCStream call. Tolerates cstream == NULL and
+     * ctx->preallocated == NULL (partial teardown).
+     */
+    rc = NGX_OK;
+
+    if (cstream != NULL) {
+        rv = ZSTD_freeCStream(cstream);
+        if (ctx->cstream == cstream) {
+            ctx->cstream = NULL;
+        }
+        if (ZSTD_isError(rv)) {
+            ngx_log_error(err_level, r->connection->log, 0,
+                          "ZSTD_freeCStream() failed: %s",
+                          ZSTD_getErrorName(rv));
+            rc = NGX_ERROR;
+        }
+    }
+
+    if (ctx->preallocated != NULL) {
+        ngx_pfree(r->pool, ctx->preallocated);
+        ctx->preallocated = NULL;
+    }
+
+    return rc;
 }
 
 
@@ -1577,45 +1557,16 @@ static void
 ngx_http_zstd_filter_cleanup(void *data)
 {
     /*
-     * Direction A: per-request safety net registered alongside CStream
-     * creation. Runs when r->pool is destroyed, which is AFTER all
-     * filter activity has ceased. Two scenarios:
-     *
-     *   1. Fast path (body filter reached done/failed): the body filter
-     *      called ZSTD_freeCStream and nulled ctx->cstream. This handler
-     *      then sees ctx->cstream == NULL and is a no-op.
-     *
-     *   2. Abort path: ctx->cstream is still non-NULL because
-     *      ngx_http_zstd_body_filter never reached its done/failed
-     *      branches. Concrete scenarios where this can happen:
-     *
-     *      a) Upstream finalize: another module calls
-     *         ngx_http_finalize_request before our body_filter gets
-     *         invoked again (e.g. limit_req fires after one body filter
-     *         iteration, or upstream proxy emits NGX_ERROR between two
-     *         add_data calls). r->pool is destroyed without our filter
-     *         observing ctx->last → ctx->done never flips.
-     *      b) Header filter chain rejected later: a downstream filter
-     *         (e.g. addition, sub) decides to fail after our header
-     *         filter installed ctx and our first body_filter call
-     *         allocated CStream — finalize unwinds without re-entering
-     *         our body filter.
-     *      c) Client RST mid-stream while compress() is mid-frame: the
-     *         next body_filter call returns NGX_ERROR via failed: which
-     *         DOES nullify ctx->cstream — so this case is actually
-     *         covered by scenario 1. Listed for completeness.
-     *
-     * NOT removable: the handler exists because the body_filter
-     * done/failed branches are not guaranteed to run on every request
-     * once ctx is installed. Pool teardown is the only call site that
-     * fires unconditionally.
-     *
-     * No ngx_pfree on ctx->preallocated: pool teardown reclaims it
-     * unconditionally (it's a pool allocation). Calling ngx_pfree here
-     * would be ceremony — the pages don't return to the kernel faster
-     * because the pool is itself being torn down.
+     * Direction A abort-path safety net: pool teardown is the only call
+     * site guaranteed to fire once ctx is installed, so this handler
+     * runs ZSTD_freeCStream when the body filter never reached its
+     * done/failed branches (upstream finalize, downstream filter
+     * rejection, etc.). The fast path nulls ctx->cstream before pool
+     * teardown so this becomes a no-op. No ngx_pfree on preallocated:
+     * pool teardown reclaims it. See .claude/CLAUDE.md "Filter pipeline"
+     * for the full rationale.
      */
-    ngx_http_zstd_ctx_t *ctx = data;
+    ngx_http_zstd_ctx_t  *ctx = data;
 
     if (ctx->cstream != NULL) {
         ZSTD_freeCStream(ctx->cstream);
