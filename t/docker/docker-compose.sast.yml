@@ -1,0 +1,73 @@
+# Parallel audit run: 5 SAST tools + Valgrind, one container per service.
+#
+# Usage (from repo root):
+#   docker compose -f t/docker/docker-compose.sast.yml up --build
+#   docker compose -f t/docker/docker-compose.sast.yml run --rm summary
+#
+# Or via the host driver:
+#   bash t/sast.sh              # all in parallel, then summary
+#   bash t/sast.sh cppcheck     # single SAST tool
+#   bash t/sast.sh valgrind     # only valgrind
+#   bash t/sast.sh summary      # re-print saved SAST summary
+#
+# Results land in tmp/sast-results/ (SAST) and tmp/valgrind-logs/ (Valgrind)
+# on the host.
+#
+# Parallelism is safe across SAST tools because each container gets its own
+# writable copy-on-write layer; scan-build and gcc-fanalyzer rebuild nginx in
+# isolation. Valgrind uses a different image (zstd-nginx-valgrind) so does
+# not share state with the SAST tools at all.
+
+x-sast-base: &sast-base
+  image: zstd-nginx-sast:latest
+  build:
+    context: ../..
+    dockerfile: t/docker/Dockerfile.sast
+  volumes:
+    - ../../tmp/sast-results:/work/sast-results
+
+services:
+  scan-build:
+    <<: *sast-base
+    container_name: sast-scan-build
+    command: ["scan-build"]
+
+  clang-tidy:
+    <<: *sast-base
+    container_name: sast-clang-tidy
+    command: ["clang-tidy"]
+
+  cppcheck:
+    <<: *sast-base
+    container_name: sast-cppcheck
+    command: ["cppcheck"]
+
+  gcc-fanalyzer:
+    <<: *sast-base
+    container_name: sast-gcc-fanalyzer
+    command: ["gcc-fanalyzer"]
+
+  flawfinder:
+    <<: *sast-base
+    container_name: sast-flawfinder
+    command: ["flawfinder"]
+
+  # Valgrind uses its own image (statically-built nginx with -O0 -g); the
+  # self-contained entrypoint wraps nginx + runs pytest + collects logs.
+  valgrind:
+    image: zstd-nginx-valgrind:latest
+    build:
+      context: ../..
+      dockerfile: t/docker/Dockerfile.valgrind
+    container_name: sast-valgrind
+    volumes:
+      - ../regression:/opt/regression:ro
+      - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ../../tmp/valgrind-logs:/work/valgrind-logs
+
+  # Manual: `docker compose ... run --rm summary` after parallel run completes
+  summary:
+    <<: *sast-base
+    container_name: sast-summary
+    profiles: ["manual"]
+    command: ["summary"]
