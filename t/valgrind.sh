@@ -160,7 +160,7 @@ fi
 
 echo
 echo "=== valgrind summary ==="
-echo "  regression scripts: ${SCRIPTS[*]}"
+echo "  pytest target:      test_accept_encoding.py"
 echo "  log dir:            ${LOG_DIR}/"
 
 exit "$overall_rc"

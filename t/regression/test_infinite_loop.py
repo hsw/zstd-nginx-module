@@ -122,13 +122,18 @@ def loop_nginx():
 
 
 def _worker_cpu_jiffies(worker_pid: int) -> int:
-    """utime + stime from /proc/<pid>/stat — sum jiffies. Returns 0 on read
-    failure (worker died, etc.)."""
+    """utime + stime from /proc/<pid>/stat — sum jiffies. Raises on read
+    failure: a missing /proc/<pid>/stat means the worker has died (or
+    we sampled the wrong pid). Silently returning 0 would let the spin
+    test return delta=0 and conclude "not spinning" — i.e. mask a
+    crash. Hard-fail instead."""
     try:
         fields = Path(f"/proc/{worker_pid}/stat").read_text().split()
-        return int(fields[13]) + int(fields[14])
-    except (FileNotFoundError, IndexError, ValueError):
-        return 0
+    except FileNotFoundError as e:
+        raise AssertionError(
+            f"/proc/{worker_pid}/stat missing — worker crashed or pid is wrong"
+        ) from e
+    return int(fields[13]) + int(fields[14])
 
 
 def test_no_hang_under_short_read(loop_nginx):
@@ -151,10 +156,27 @@ def test_worker_not_spinning(loop_nginx):
     """After the short-read request returns, the worker must drop to idle.
     Sample CPU jiffies over 2s; spinning worker would burn ~2000ms, idle
     worker stays near zero. Ceiling 200ms absorbs scheduling jitter under
-    qemu / Rosetta emulation."""
+    qemu / Rosetta emulation.
+
+    Under ZSTD_REGRESSION_NO_DAEMON=1 (asan.sh / valgrind.sh) nginx runs
+    with `master_process off`, so there is no child worker — the master
+    pid IS the worker. nginx_worker_pid_from_master() returns None in
+    that case; per its docstring the caller treats None as "use the
+    master pid as the worker"."""
     master_pid_str = PID_PATH.read_text().strip()
-    worker_pid = nginx_worker_pid_from_master(int(master_pid_str))
-    assert worker_pid is not None, "could not find nginx worker pid"
+    master_pid = int(master_pid_str)
+    worker_pid = nginx_worker_pid_from_master(master_pid)
+    if worker_pid is None:
+        # master_process off — master IS the worker. Only valid under
+        # ZSTD_REGRESSION_NO_DAEMON=1 (asan.sh / valgrind.sh). In daemon
+        # mode the lookup must succeed; falling back to master_pid would
+        # sample the idle master and miss a spinning worker.
+        assert os.environ.get("ZSTD_REGRESSION_NO_DAEMON"), (
+            f"nginx_worker_pid_from_master({master_pid}) returned None in "
+            f"daemon mode — refusing to sample master (would mask spinning "
+            f"worker)"
+        )
+        worker_pid = master_pid
 
     # Drive a request first so the worker is awake.
     subprocess.run(
