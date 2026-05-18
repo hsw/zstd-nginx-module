@@ -64,22 +64,35 @@ cd "$NGINX_SRC_DIR"
 # .so load under any distro-shipped nginx binary built with --with-compat
 # (nginx.org packages are built this way). For static builds we link all
 # requested modules into a fresh nginx binary.
+#
+# Module order matters: extras are added BEFORE the main module so that
+# filter/config and static/config in the main module can sed-reorder
+# themselves relative to extras (which by then are already in
+# HTTP_FILTER_MODULES / HTTP_MODULES). Specifically: zstd's filter/config
+# moves zstd_filter after brotli_filter, and static/config moves
+# zstd_static after brotli_static — both only work if brotli's config
+# has already populated those lists. Without this order, ngx_brotli's
+# static module ends up later in ngx_modules[] than zstd_static and wins
+# the content phase (nginx core reverses the handler array in
+# ngx_http_init_phase_handlers, so "later" = "called first").
 CONFIGURE_ARGS=()
 if [ "$MODE" = "dynamic" ]; then
-    CONFIGURE_ARGS+=(--with-compat --add-dynamic-module="$MODULE_SRC")
+    CONFIGURE_ARGS+=(--with-compat)
     for extra in "$@"; do
         CONFIGURE_ARGS+=(--add-dynamic-module="$extra")
     done
+    CONFIGURE_ARGS+=(--add-dynamic-module="$MODULE_SRC")
 else
     # static build pulls in http_ssl + http_v2 so a realistic nginx is
     # produced; the gzip filter is on by default so filter/config's
     # filter-priority sed can exercise brotli > zstd > gzip ordering at
     # link time. http_v2 makes the brotli variant usable by pytest
     # test_h2_truncation / test_http2_proxy_flush (they skip otherwise).
-    CONFIGURE_ARGS+=(--with-http_ssl_module --with-http_v2_module --add-module="$MODULE_SRC")
+    CONFIGURE_ARGS+=(--with-http_ssl_module --with-http_v2_module)
     for extra in "$@"; do
         CONFIGURE_ARGS+=(--add-module="$extra")
     done
+    CONFIGURE_ARGS+=(--add-module="$MODULE_SRC")
 fi
 
 ./configure "${CONFIGURE_ARGS[@]}"

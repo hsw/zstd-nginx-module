@@ -110,5 +110,33 @@ ngx_module_type=HTTP
 ngx_module_name=ngx_http_zstd_static_module
 ngx_module_incs="$ngx_zstd_opt_I"
 ngx_module_srcs=$HTTP_ZSTD_SRCS
+# Module-order: zstd_static wins over brotli_static / gzip_static when a
+# resource has multiple precompressed sidecars and the client accepts more
+# than one encoding. Matches the filter-side precedence (filter/config:112)
+# so static and on-the-fly paths agree on which encoding to serve.
+# Closes upstream tokers/zstd-nginx-module#40 (mklooss).
+ngx_module_order="$ngx_module_name \
+                  ngx_http_brotli_static_module \
+                  ngx_http_gzip_static_module"
 
 . auto/module
+
+if [ "$ngx_module_link" != DYNAMIC ]; then
+    # ngx_module_order doesn't work with static modules (only honoured for
+    # --add-dynamic-module builds), so we must reorder HTTP_MODULES here.
+    # Mirror filter/config:131 pattern: pick the next module by precedence
+    # so the source-list order ends up as zstd_static before brotli_static
+    # / gzip_static — nginx wraps content handlers in LIFO order, so a later
+    # source-list entry runs earlier in the runtime chain.
+    if echo $HTTP_MODULES | grep ngx_http_brotli_static_module >/dev/null; then
+        next=ngx_http_brotli_static_module
+    elif echo $HTTP_MODULES | grep ngx_http_gzip_static_module >/dev/null; then
+        next=ngx_http_gzip_static_module
+    else
+        next=ngx_http_static_module
+    fi
+
+    HTTP_MODULES=`echo $HTTP_MODULES \
+                  | sed "s/$ngx_module_name//" \
+                  | sed "s/$next/$next $ngx_module_name/"`
+fi
