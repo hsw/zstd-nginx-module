@@ -813,6 +813,8 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
                           "ZSTD_freeCStream() failed: %s",
                           ZSTD_getErrorName(rc));
         }
+        ngx_pfree(r->pool, ctx->preallocated);
+        ctx->preallocated = NULL;
         return NULL;
     }
     cln->handler = ngx_http_zstd_filter_cleanup;
@@ -876,6 +878,28 @@ failed:
         ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
                       "ZSTD_freeCStream() failed: %s", ZSTD_getErrorName(rc));
     }
+
+    /*
+     * Disarm the cleanup handler we already registered: cstream is now
+     * freed and ctx->cstream stays NULL (caller assigns our NULL return
+     * value), so the handler would be a no-op — but explicit disarm
+     * removes the brittle dependency on ctx->cstream observation order
+     * if the call-site contract changes (e.g. caller pre-assigns ctx->
+     * cstream = something stale). Pool cleanup with handler==NULL is
+     * defined as no-op (see src/core/ngx_palloc.c:ngx_destroy_pool).
+     */
+    cln->handler = NULL;
+
+    /*
+     * Release the preallocated workspace eagerly here too — failure in
+     * init is rare but when it fires (e.g. CCtx_reset or refCDict error)
+     * the request still completes via the body_filter failed: branch,
+     * which can't reach its own ngx_pfree because ctx->preallocated has
+     * already served its purpose. Eager release returns the mmap'd pages
+     * to the kernel rather than pinning them until r->pool teardown.
+     */
+    ngx_pfree(r->pool, ctx->preallocated);
+    ctx->preallocated = NULL;
 
     return NULL;
 }
@@ -1554,17 +1578,37 @@ ngx_http_zstd_filter_cleanup(void *data)
 {
     /*
      * Direction A: per-request safety net registered alongside CStream
-     * creation. Mirrors ngx_http_zstd_cdict_cleanup's pattern but at
-     * request scope. Runs when r->pool is destroyed, which is AFTER all
+     * creation. Runs when r->pool is destroyed, which is AFTER all
      * filter activity has ceased. Two scenarios:
      *
-     *   1. Fast path (body filter saw ctx->done flip): the body filter
+     *   1. Fast path (body filter reached done/failed): the body filter
      *      called ZSTD_freeCStream and nulled ctx->cstream. This handler
      *      then sees ctx->cstream == NULL and is a no-op.
      *
-     *   2. Abort path (client RST mid-compression, upstream finalize,
-     *      header-filter rejected request after ctx was created, etc.):
-     *      ctx->cstream is still non-NULL, so this handler frees it.
+     *   2. Abort path: ctx->cstream is still non-NULL because
+     *      ngx_http_zstd_body_filter never reached its done/failed
+     *      branches. Concrete scenarios where this can happen:
+     *
+     *      a) Upstream finalize: another module calls
+     *         ngx_http_finalize_request before our body_filter gets
+     *         invoked again (e.g. limit_req fires after one body filter
+     *         iteration, or upstream proxy emits NGX_ERROR between two
+     *         add_data calls). r->pool is destroyed without our filter
+     *         observing ctx->last → ctx->done never flips.
+     *      b) Header filter chain rejected later: a downstream filter
+     *         (e.g. addition, sub) decides to fail after our header
+     *         filter installed ctx and our first body_filter call
+     *         allocated CStream — finalize unwinds without re-entering
+     *         our body filter.
+     *      c) Client RST mid-stream while compress() is mid-frame: the
+     *         next body_filter call returns NGX_ERROR via failed: which
+     *         DOES nullify ctx->cstream — so this case is actually
+     *         covered by scenario 1. Listed for completeness.
+     *
+     * NOT removable: the handler exists because the body_filter
+     * done/failed branches are not guaranteed to run on every request
+     * once ctx is installed. Pool teardown is the only call site that
+     * fires unconditionally.
      *
      * No ngx_pfree on ctx->preallocated: pool teardown reclaims it
      * unconditionally (it's a pool allocation). Calling ngx_pfree here

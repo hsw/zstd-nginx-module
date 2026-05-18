@@ -128,20 +128,6 @@ def workspace_nginx():
         stop_nginx()
 
 
-def _warmup_compression(url_path: str) -> None:
-    """One compression request fully drained — touches libzstd's working
-    set + grows glibc's heap pool. Subsequent compression-RSS samples
-    are then comparable across runs without first-request lazy-alloc noise."""
-    r = requests.get(
-        f"{BASE_URL}{url_path}",
-        headers={"Accept-Encoding": "zstd"},
-        timeout=10,
-        stream=True,
-    )
-    _ = r.raw.read(decode_content=False)
-    r.close()
-
-
 def test_workspace_compression_smoke(workspace_nginx):
     """Smoke: GET the 1 MB compressible fixture, assert zstd encoding +
     decompressed length matches input. This is the existence-of-codepath
@@ -215,12 +201,25 @@ def test_workspace_memory_observed(workspace_nginx):
         rss_t1 = _proc_status_kib(worker_pid, "VmRSS")
         vsz_t1 = _proc_status_kib(worker_pid, "VmSize")
 
+    # Verify T1 actually hit the compression path (otherwise the RSS
+    # sample is meaningless — workspace was never allocated, no fix to
+    # measure). Headers-only check; the body is captured in the
+    # subsequent recv() iterations we deliberately skip.
+    headers_lower = buf.lower()
+    assert b"content-encoding: zstd" in headers_lower, (
+        f"T1 response did not compress with zstd; raw headers:\n"
+        f"{buf!r}"
+    )
+
     # Fast-drain checkpoint (T2)
     r = requests.get(
         f"{BASE_URL}/workspace/{COMPRESSIBLE_BODY_NAME}",
         headers={"Accept-Encoding": "zstd"},
         timeout=10,
         stream=True,
+    )
+    assert r.headers.get("Content-Encoding") == "zstd", (
+        f"T2 response did not compress with zstd; headers:\n{r.headers}"
     )
     _ = r.raw.read(decode_content=False)
     r.close()
@@ -291,13 +290,26 @@ def test_workspace_no_fallback(level):
                 timeout=10,
                 stream=True,
             )
+            assert r.headers.get("Content-Encoding") == "zstd", (
+                f"path {path} did not compress; headers:\n{r.headers}"
+            )
             _ = r.raw.read(decode_content=False)
             r.close()
 
         time.sleep(0.1)  # let nginx flush deferred WARN entries
-        log_content = log_path.read_text() if log_path.exists() else ""
     finally:
         stop_nginx()
+
+    # Guard against vacuous pass: if the error_log file is absent the
+    # `not in ""` check would silently succeed even when the directive
+    # failed to apply. nginx must have produced this file via the
+    # `error_log` directive above.
+    assert log_path.exists(), (
+        f"expected error_log at {log_path}; directive did not apply or "
+        f"nginx never logged. The vacuous-pass guard caught this — fix "
+        f"the test harness before treating fallback as 'never fires'."
+    )
+    log_content = log_path.read_text()
 
     assert "zstd workspace exhausted" not in log_content, (
         f"At zstd_comp_level={level} libzstd needed more than "
