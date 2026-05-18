@@ -1,11 +1,19 @@
-"""Structural regression tests for the zstd body filter's action state
-machine (ctx->action transitions in ngx_http_zstd_filter_compress).
+"""Observable-behaviour regression tests for the zstd body filter's
+compress entry shapes.
 
-Each parametrized case pins a specific code path inside compress():
-  * empty            — last_buf=1 on zero-byte buffer_in → sentinel-buf path
-  * single-byte      — minimal COMPRESS→END cycle
-  * h1-131072        — HTTP/1.1 counterpart to h2-truncation
-  * h1-200000        — multi-redo COMPRESS↔FLUSH cycling at scale
+Post-Task-3 (V2 per-call-op refactor) the filter no longer carries an
+explicit action state machine; flush/end op derivation is per-call from
+the sticky-finish flags. These tests assert decompressed byte-equality
+across the entry shapes that previously exercised distinct state-machine
+branches — coverage is now black-box (request → response → decompress
+→ compare to ground truth) rather than whitebox.
+
+Each parametrized case exercises a distinct entry shape:
+  * empty            — last_buf=1 on zero-byte buffer_in (sentinel-buf path)
+  * single-byte      — minimal terminate-immediately path
+  * h1-131072        — HTTP/1.1 counterpart to h2-truncation (chain-link
+                       boundary at ZSTD_CStreamInSize())
+  * h1-200000        — multi-iteration drain at scale
   * disk-vs-proxy    — disk static file vs proxy_pass (in_file buffer vs
                        in-memory chain link) — decompressed must match
                        byte-for-byte
@@ -15,8 +23,8 @@ Plus two non-parametrized tests:
   * parallel_burst   — 20 concurrent connections, mixed sizes, re-entrancy
 
 Coverage scope: byte-equality + valid framing across all entry shapes.
-Does NOT catch the production flush-promotion latency bug — see
-docs/upstream-coverage.md G1 for the V2 hardening work.
+The production flush-promotion latency bug is exercised by
+`test_proxy_flush.py` (chunked-off-tiny sub-test).
 """
 
 from __future__ import annotations

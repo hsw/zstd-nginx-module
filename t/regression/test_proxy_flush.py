@@ -16,12 +16,12 @@ without needing the additional small-chunk escalation tiers documented
 in the migration plan.
 
 The added `chunked-off-tiny` sub-test below is a focused, tighter
-production-shape repro: a 50-chunk × 200-byte schedule with 50 ms inter-
-chunk gap and a 400 ms TTFB budget. It is wrapped with
-`pytest.mark.xfail(strict=True)` until commit 3 retires the action state
-machine and adopts ngx_brotli's per-call-op pattern. strict=True ensures
-that if the test goes PASS prematurely (e.g. an unintended baseline fix
-or overfit discovery params), pytest treats it as a failure.
+production-shape repro: a 50-chunk x 200-byte schedule with 50 ms inter-
+chunk gap and a 400 ms TTFB budget. It originally landed as
+`pytest.mark.xfail(strict=True)` to bug-confirm the action-machine flush-
+promotion class on `stable` HEAD; the xfail marker was removed in
+commit 3 of `v2/compress-stream2` once the per-call-op refactor closed
+the bug. It now PASSes as a regression guard.
 
 The Python TCP fixture server is started by a module-scoped pytest
 fixture so the threaded handler thread doesn't leak between tests.
@@ -298,27 +298,16 @@ CASES = [
     FlushCase("sse", "/sse/", "sse", max_ttfb_ms=600),
     FlushCase("upgrade", "/upgrade/", "upgrade", max_ttfb_ms=0),
     # chunked-off-tiny: Tier-1 focused production-shape repro per the
-    # migration plan. 50 × 200 B chunks, 50 ms gap, TTFB budget 400 ms.
+    # migration plan. 50 x 200 B chunks, 50 ms gap, TTFB budget 400 ms.
     # The existing chunked-off/sse/upgrade cases already discriminate the
     # bug (they hang on stable HEAD); this tighter variant is the
     # canonical small-chunk repro for the action-machine flush-promotion
     # bug from tokers/zstd-nginx-module#23 (mklooss / Stensel8 /
-    # lowkeypriority). xfail (strict=True): goes PASS only after commit
-    # 3 retires the action state machine and adopts ngx_brotli's per-
-    # call-op pattern. strict=True flags any premature pass as failure.
-    pytest.param(
-        FlushCase(
-            "chunked-off-tiny", "/chunked-off-tiny/", "chunked-tiny",
-            max_ttfb_ms=400,
-        ),
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "action-machine flush-promotion bug "
-                "(tokers/zstd-nginx-module#23); closed by per-call-op "
-                "refactor in commit 3 of v2/compress-stream2"
-            ),
-        ),
+    # lowkeypriority). Now passes after the per-call-op refactor retired
+    # the action state machine (commit 3 of v2/compress-stream2).
+    FlushCase(
+        "chunked-off-tiny", "/chunked-off-tiny/", "chunked-tiny",
+        max_ttfb_ms=400,
     ),
 ]
 
