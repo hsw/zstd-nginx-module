@@ -103,6 +103,7 @@ static void * ngx_http_zstd_filter_alloc(void *opaque, size_t size);
 static void ngx_http_zstd_filter_free(void *opaque, void *address);
 static char *ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data);
 static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static void ngx_http_zstd_cdict_cleanup(void *data);
 
 
 static ngx_http_zstd_comp_level_bounds_t  ngx_http_zstd_comp_level_bounds = {
@@ -780,6 +781,7 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     u_char                     *buf;
     ngx_file_info_t             info;
     ngx_http_zstd_main_conf_t  *zmcf;
+    ngx_pool_cleanup_t         *cln;
 
     rc = NGX_OK;
     buf = NULL;
@@ -834,6 +836,17 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
             }
 
             size = ngx_file_size(&info);
+            /*
+             * `buf` must outlive `conf->dict`: ZSTD_createCDict_byReference
+             * below stores a non-owning pointer to these bytes inside the
+             * CDict, so libzstd will read from `buf` for the entire lifetime
+             * of the dict (i.e. until our pool cleanup runs ZSTD_freeCDict).
+             * Both allocations live on cf->pool and cleanups run before
+             * palloc'd memory is released, so the lifetime contract is held.
+             * Do not move `buf` to a shorter-lived pool without also
+             * removing `_byReference` (use ZSTD_createCDict instead, which
+             * copies the dict bytes internally).
+             */
             buf = ngx_palloc(cf->pool, size);
             if (buf == NULL) {
                 rc = NGX_CONF_ERROR;
@@ -865,6 +878,26 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
                 rc = NGX_CONF_ERROR;
                 goto close;
             }
+
+            /*
+             * Register a pool cleanup so the CDict is freed when the
+             * configuration cycle is destroyed (e.g. on `nginx -s reload`).
+             * Without this, every reload that re-parses zstd_dict_file
+             * leaks one CDict allocation for the lifetime of the master
+             * process. Quantification deferred to V2 (ASan in CI).
+             */
+            cln = ngx_pool_cleanup_add(cf->pool, 0);
+            if (cln == NULL) {
+                ZSTD_freeCDict(conf->dict);
+                conf->dict = NULL;
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "ngx_pool_cleanup_add() failed");
+                rc = NGX_CONF_ERROR;
+                goto close;
+            }
+
+            cln->handler = ngx_http_zstd_cdict_cleanup;
+            cln->data = conf->dict;
         }
     }
 
@@ -1032,4 +1065,15 @@ ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, vo
     }
 
     return NGX_CONF_OK;
+}
+
+
+static void
+ngx_http_zstd_cdict_cleanup(void *data)
+{
+    ZSTD_CDict  *dict = data;
+
+    if (dict != NULL) {
+        ZSTD_freeCDict(dict);
+    }
 }
