@@ -5,6 +5,28 @@ plus the wildcard case.
 The .sh version uses curl -sSI (HEAD) against /text — 180-byte deterministic
 text/plain body, large enough to compress, small enough that timing isn't a
 concern. We use requests.head() for the same effect.
+
+TODO (follow-up branch `test/ae-parser-coverage`): expand coverage. The
+review-phase-1 testing reviewer flagged 14 gaps; the categories to fill in
+a dedicated coverage pass are:
+
+  * q-value parser branches — only q=0 and q=1 are exercised today; the
+    parser has ~12 distinct branches (q=0.x for x in 1..9, fractional
+    digits 1..3, q=1.0, q=1.000, malformed q=, q=., q=2, etc.).
+  * OWS variants around `;` — the exact bug fixed by commit 32e7f75
+    (`zstd ;q=0`, `zstd; q=0`, `zstd\\t;q=0`) has no regression test.
+  * Non-q parameter branch (e.g. `zstd;foo=bar`) is entirely untested.
+  * Case variation in the parameter name (`Q=`, `q=`).
+  * Multi-token combinations (`zstd;q=0, zstd`, `zstd, zstd;q=0`,
+    `zstdx, zstd`).
+  * Boundary/truncation inputs (`zstd;`, `zstd;q`, `zstd;q=`).
+  * Filter/static parity — no shared CASES table across both pytest
+    files; drift risk if a fix lands in one and not the other.
+  * False-prefix variants (`notzstd`, `xzstd`, `zstd-future`).
+
+Out of scope for this iteration: log-content assertions, ZSTD_VERSION
+fallback path, CDict cleanup ASan reload-loop, body-bytes roundtrip,
+Vary header assertions — see review report for the full T1–T14 list.
 """
 
 import pytest

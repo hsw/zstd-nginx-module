@@ -91,6 +91,10 @@ Specifies the external dictionary.
 
 Enables or disables zstd compression for response.
 
+#### Accept-Encoding handling
+
+The Accept-Encoding header is parsed per RFC 9110. `zstd;q=0` explicitly disables zstd for that request and the parser continues scanning for another acceptable token. Optional whitespace (OWS) is tolerated around `;` (e.g. `zstd ;q=0`, `zstd;\tq=0`). Token matching is strict: false-prefix names like `zstdx` no longer match. Matching is case-insensitive (both the encoding token and the `q=` parameter name). The wildcard `*` is intentionally not honoured — matching upstream nginx gzip semantics. Both `zstd` and `zstd_static` use the same parser.
+
 ### zstd_comp_level
 
 **Syntax:** *zstd_comp_level level;*  

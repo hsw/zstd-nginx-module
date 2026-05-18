@@ -1,8 +1,9 @@
 """Pytest port of t/regression/static-edge-cases.sh.
 
-Same 15 cases as the .sh original, with the q=0 case left as-is (it fails on
-master — bug #1 mirror in the static module, which deliberately doesn't parse
-q-values per the comment in static/ngx_http_zstd_static_module.c:323-333).
+Same 15 cases as the .sh original. The static module now honours q=0 and
+tolerates OWS around `;` (commits 5e43352 and 32e7f75); the historic
+"expected to FAIL on master" caveat is therefore obsolete and all cases
+in PLAIN_CASES (including q=0) should pass.
 
 Module-scoped fixture: all 15 cases share one nginx instance + one fixture
 directory. Setup creates the regular, plain-only, unreadable, directory-
@@ -166,10 +167,9 @@ def test_serves_zstd_sidecar(static_edge_nginx, label, path, ae):
 
 PLAIN_CASES = [
     # (label, path, accept_encoding, expected_plain_path)
-    # q=0: master's static module DELIBERATELY doesn't parse q-values
-    # (see static/ngx_http_zstd_static_module.c:323-333). This test is
-    # therefore expected to FAIL on master code — the .sh original
-    # documents the same; we preserve the behaviour-fixing intent.
+    # q=0: now honoured by the static module (post commit 5e43352 — the
+    # RFC 9110 parser fix). The .sh original documented this as "fails on
+    # master" but that caveat is obsolete on this branch.
     ("on-q-zero-skipped",         "/static-on/sample",     "zstd;q=0",   STATIC_FILE),
     ("on-false-prefix-skipped",   "/static-on/sample",     "zstdx",      STATIC_FILE),
     ("on-wildcard-only-skipped",  "/static-on/sample",     "*",          STATIC_FILE),
