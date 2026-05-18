@@ -21,15 +21,19 @@ cd "$REPO_ROOT"
 
 IMAGE="zstd-nginx-asan:latest"
 CNAME="zstd-asan-$$"
-PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
+# Empty = let docker pick the host's native architecture. Set
+# ZSTD_TEST_PLATFORM=linux/amd64 in CI if production-parity arch is needed.
+PLATFORM="${ZSTD_TEST_PLATFORM:-}"
+PLATFORM_FLAG=()
+[ -n "$PLATFORM" ] && PLATFORM_FLAG=(--platform "$PLATFORM")
 PORT="${ZSTD_TEST_PORT:-8080}"
 LOG_DIR="${REPO_ROOT}/tmp/asan-logs"
 mkdir -p "$LOG_DIR"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "==> building ${IMAGE} from t/docker/Dockerfile.asan (--platform ${PLATFORM})"
+    echo "==> building ${IMAGE} from t/docker/Dockerfile.asan (platform=${PLATFORM:-native})"
     docker build \
-        --platform "$PLATFORM" \
+        ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
         -t "$IMAGE" \
         -f t/docker/Dockerfile.asan \
         . || {
@@ -45,7 +49,7 @@ done
 
 echo "==> starting ${CNAME} (port ${PORT})"
 cid="$(docker run -d --rm \
-        --platform "$PLATFORM" \
+        ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
         --name "$CNAME" \
         -p "${PORT}:8080" \
         -v "${REPO_ROOT}/t/regression:/opt/regression:ro" \

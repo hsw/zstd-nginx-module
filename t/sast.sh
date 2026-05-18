@@ -31,14 +31,17 @@ case "$TOOL" in
 esac
 
 IMAGE="zstd-nginx-sast:latest"
-PLATFORM="${ZSTD_TEST_PLATFORM:-linux/amd64}"
+# Empty = let docker pick the host's native architecture.
+PLATFORM="${ZSTD_TEST_PLATFORM:-}"
+PLATFORM_FLAG=()
+[ -n "$PLATFORM" ] && PLATFORM_FLAG=(--platform "$PLATFORM")
 RESULTS_DIR="${REPO_ROOT}/tmp/sast-results"
 mkdir -p "$RESULTS_DIR"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    echo "==> building ${IMAGE} from t/docker/Dockerfile.sast (--platform ${PLATFORM})"
+    echo "==> building ${IMAGE} from t/docker/Dockerfile.sast (platform=${PLATFORM:-native})"
     docker build \
-        --platform "$PLATFORM" \
+        ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
         -t "$IMAGE" \
         -f t/docker/Dockerfile.sast \
         . || {
@@ -49,7 +52,7 @@ fi
 
 echo "==> running SAST tool '${TOOL}' (results -> tmp/sast-results/)"
 docker run --rm \
-    --platform "$PLATFORM" \
+    ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
     -v "${RESULTS_DIR}:/work/sast-results" \
     "$IMAGE" \
     "$TOOL"

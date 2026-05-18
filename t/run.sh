@@ -116,8 +116,11 @@ run_variant() {
     # current nginx.conf.template so iterating on either doesn't require
     # rebuilding the Docker image. The image's own COPYs of these paths are
     # shadowed by the bind mounts.
+    # Conditional --platform: empty ZSTD_TEST_PLATFORM = docker picks native.
+    local platform_flag=()
+    [ -n "${ZSTD_TEST_PLATFORM:-}" ] && platform_flag=(--platform "$ZSTD_TEST_PLATFORM")
     if ! cid="$(docker run -d --rm \
-            --platform "${ZSTD_TEST_PLATFORM:-linux/amd64}" \
+            ${platform_flag[@]+"${platform_flag[@]}"} \
             --name "$cname" \
             -p "${ZSTD_TEST_PORT}:8080" \
             -v "${REPO_ROOT}/t/regression:/opt/regression:ro" \
