@@ -53,25 +53,37 @@ GROUND_TRUTH_LOCK = threading.Lock()
 
 def _send_chunked(c: socket.socket) -> None:
     """6 chunks × ~10 KiB random tail, 200 ms gap. Total upstream window
-    ~1.2 s, total body ~60 KiB."""
+    ~1.2 s, total body ~60 KiB.
+
+    Ground truth is precomputed and recorded BEFORE the first send so the
+    test thread never observes a stale/None entry under scheduling jitter."""
+    chunks = [f"chunk-{i:02d}-".encode() + os.urandom(10240) for i in range(6)]
+    full = b"".join(chunks)
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["chunked"] = full
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
         b"Transfer-Encoding: chunked\r\n"
         b"\r\n"
     )
-    full = bytearray()
-    for i in range(6):
-        chunk = f"chunk-{i:02d}-".encode() + os.urandom(10240)
-        full.extend(chunk)
+    for chunk in chunks:
         c.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
         time.sleep(0.2)
     c.sendall(b"0\r\n\r\n")
-    with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["chunked"] = bytes(full)
 
 
 def _send_sse(c: socket.socket) -> None:
+    """Ground truth is precomputed and recorded BEFORE the first send so
+    the test thread never observes a stale/None entry under scheduling
+    jitter."""
+    events = []
+    for i in range(8):
+        payload = os.urandom(240).hex()
+        events.append(f"event: msg\ndata: {i:02d}-{payload}\n\n".encode())
+    full = b"".join(events)
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["sse"] = full
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/event-stream\r\n"
@@ -79,19 +91,17 @@ def _send_sse(c: socket.socket) -> None:
         b"Connection: close\r\n"
         b"\r\n"
     )
-    full = bytearray()
-    for i in range(8):
-        payload = os.urandom(240).hex()
-        evt = f"event: msg\ndata: {i:02d}-{payload}\n\n".encode()
-        full.extend(evt)
+    for evt in events:
         c.sendall(evt)
         time.sleep(0.2)
-    with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["sse"] = bytes(full)
 
 
 def _send_upgrade(c: socket.socket) -> None:
+    """Ground truth is recorded BEFORE the send so the test thread never
+    observes a stale/None entry under scheduling jitter."""
     body = b"upgrade-stand-in-body-" + b"y" * 200 + b"\n"
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["upgrade"] = body
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: application/octet-stream\r\n"
@@ -99,8 +109,6 @@ def _send_upgrade(c: socket.socket) -> None:
         b"Connection: close\r\n"
         b"\r\n" + body
     )
-    with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["upgrade"] = body
 
 
 def _handle(c: socket.socket) -> None:

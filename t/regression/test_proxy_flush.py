@@ -9,13 +9,21 @@ Background — production reports on the tokers/zstd-nginx-module#23 thread:
                           freeze (nginx 1.29.3).
   * lowkeypriority 2026-02-02 — same as Stensel8.
 
-The four sub-tests below map to four upstream patterns the production bug
-manifests under. They are byte-equality + hang-ceiling regression nets at
-this scope; tightening to actually fail on master baseline (TTFB / latency
-discrimination) needs bigger chunks + HTTP/2-to-client + real WebSocket
-framing — V2 hardening work tracked in docs/upstream-coverage.md G1/G2.
+The four "production-shape" sub-tests (chunked-on/off, sse, upgrade) map
+to four upstream patterns the bug manifests under. On `stable` HEAD they
+ALREADY fail (ReadTimeoutError / hang) — i.e. they discriminate the bug
+without needing the additional small-chunk escalation tiers documented
+in the migration plan.
 
-The Python TCP fixture server is started by a session-scoped pytest
+The added `chunked-off-tiny` sub-test below is a focused, tighter
+production-shape repro: a 50-chunk × 200-byte schedule with 50 ms inter-
+chunk gap and a 400 ms TTFB budget. It is wrapped with
+`pytest.mark.xfail(strict=True)` until commit 3 retires the action state
+machine and adopts ngx_brotli's per-call-op pattern. strict=True ensures
+that if the test goes PASS prematurely (e.g. an unintended baseline fix
+or overfit discovery params), pytest treats it as a failure.
+
+The Python TCP fixture server is started by a module-scoped pytest
 fixture so the threaded handler thread doesn't leak between tests.
 """
 
@@ -48,27 +56,66 @@ def _send_chunked(c: socket.socket) -> None:
     proxy_buffer_size (4-8 KiB) so the chunks fragment into multiple chain
     links when proxy_buffering is off, but still well under
     ZSTD_CStreamInSize (~128 KiB) so the bug isn't masked by libzstd's
-    natural spill."""
+    natural spill.
+
+    Ground truth is precomputed and recorded BEFORE the first send so the
+    test thread never observes a stale/None entry under scheduling jitter."""
+    chunks = [f"chunk-{i:02d}-".encode() + os.urandom(10240) for i in range(6)]
+    full = b"".join(chunks)
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["chunked"] = full
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/plain\r\n"
         b"Transfer-Encoding: chunked\r\n"
         b"\r\n"
     )
-    full = bytearray()
-    for i in range(6):
-        chunk = f"chunk-{i:02d}-".encode() + os.urandom(10240)
-        full.extend(chunk)
+    for chunk in chunks:
         c.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
         time.sleep(0.2)
     c.sendall(b"0\r\n\r\n")
+
+
+def _send_chunked_tiny(c: socket.socket) -> None:
+    """50 chunks * 200 bytes random tail, 50 ms gap. Total upstream window
+    ~2.5 s, total body ~10 KiB. Tier-1 production-shape repro per the
+    migration plan: small chunks where libzstd swallows input without
+    immediate spill (rc==0), so the legacy action state machine never
+    promotes COMPRESS → FLUSH and bytes stay buffered until upstream
+    close. Healthy filter (per-call-op) emits each chunk on b->flush=1
+    within ~first-chunk-arrival latency (~50-100 ms).
+
+    Ground truth is precomputed and recorded BEFORE the first send so the
+    test thread never observes a stale/None entry under scheduling jitter."""
+    chunks = [f"tiny-{i:02d}-".encode() + os.urandom(200) for i in range(50)]
+    full = b"".join(chunks)
     with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["chunked"] = bytes(full)
+        GROUND_TRUTH["chunked-tiny"] = full
+    c.sendall(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    )
+    for chunk in chunks:
+        c.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+        time.sleep(0.05)
+    c.sendall(b"0\r\n\r\n")
 
 
 def _send_sse(c: socket.socket) -> None:
     """8 SSE events with 200 ms gap. Each event ~512 bytes — realistic
-    SSE traffic shape, total upstream window ~1.6 s."""
+    SSE traffic shape, total upstream window ~1.6 s.
+
+    Ground truth is precomputed and recorded BEFORE the first send so the
+    test thread never observes a stale/None entry under scheduling jitter."""
+    events = []
+    for i in range(8):
+        payload = os.urandom(240).hex()
+        events.append(f"event: msg\ndata: {i:02d}-{payload}\n\n".encode())
+    full = b"".join(events)
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["sse"] = full
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: text/event-stream\r\n"
@@ -76,23 +123,22 @@ def _send_sse(c: socket.socket) -> None:
         b"Connection: close\r\n"
         b"\r\n"
     )
-    full = bytearray()
-    for i in range(8):
-        payload = os.urandom(240).hex()
-        evt = f"event: msg\ndata: {i:02d}-{payload}\n\n".encode()
-        full.extend(evt)
+    for evt in events:
         c.sendall(evt)
         time.sleep(0.2)
-    with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["sse"] = bytes(full)
 
 
 def _send_upgrade(c: socket.socket) -> None:
     """Stand-in for WebSocket — plain 200 + buffered body. Real WebSocket
     framing needs the `websockets` library (V2). The point here is to
     exercise the zstd filter under Upgrade-shaped request headers, not the
-    framing protocol itself."""
+    framing protocol itself.
+
+    Ground truth is recorded BEFORE the send so the test thread never
+    observes a stale/None entry under scheduling jitter."""
     body = b"upgrade-stand-in-body-" + b"y" * 200 + b"\n"
+    with GROUND_TRUTH_LOCK:
+        GROUND_TRUTH["upgrade"] = body
     c.sendall(
         b"HTTP/1.1 200 OK\r\n"
         b"Content-Type: application/octet-stream\r\n"
@@ -100,8 +146,6 @@ def _send_upgrade(c: socket.socket) -> None:
         b"Connection: close\r\n"
         b"\r\n" + body
     )
-    with GROUND_TRUTH_LOCK:
-        GROUND_TRUTH["upgrade"] = body
 
 
 def _handle(c: socket.socket) -> None:
@@ -118,7 +162,9 @@ def _handle(c: socket.socket) -> None:
             path = buf.split(b"\r\n", 1)[0].decode("latin-1").split(" ")[1]
         except (IndexError, UnicodeDecodeError):
             path = ""
-        if path.startswith("/chunked"):
+        if path.startswith("/chunked-tiny"):
+            _send_chunked_tiny(c)
+        elif path.startswith("/chunked"):
             _send_chunked(c)
         elif path.startswith("/sse"):
             _send_sse(c)
@@ -198,6 +244,16 @@ EXTRA_LOCATIONS = f"""
         proxy_set_header Upgrade websocket;
         proxy_buffering off;
     }}
+    # Sub-test chunked-off-tiny: Tier-1 production-shape repro — small
+    # chunks (50 × 200 B, 50 ms gap) where the action state-machine bug
+    # prevents COMPRESS → FLUSH promotion when libzstd swallows input
+    # without spilling (rc==0). xfail (strict=True) on stable HEAD;
+    # closed by commit 3 (per-call-op pattern).
+    location /chunked-off-tiny/ {{
+        proxy_pass http://127.0.0.1:{FIXTURE_PORT}/chunked-tiny;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+    }}
 """
 
 
@@ -235,16 +291,47 @@ CASES = [
     # to make TTFB discriminative. Byte-equality + hang ceiling only.
     FlushCase("chunked-on", "/chunked-on/", "chunked", max_ttfb_ms=0),
     # chunked-off: proxy_buffering off. Each chunk reaches body filter
-    # with b->flush=1. Expected (post 0.2.1 flush promotion): TTFB ≤ 600
-    # ms. On master baseline: ALSO under 600 ms in our docker — chunks
-    # are too small to surface the bug. Documented gap.
+    # with b->flush=1. On stable HEAD this fails (ReadTimeoutError, hang)
+    # — production-shape repro of the flush-promotion bug. Healthy filter
+    # emits each chunk on b->flush=1; TTFB ≤ 600 ms.
     FlushCase("chunked-off", "/chunked-off/", "chunked", max_ttfb_ms=600),
     FlushCase("sse", "/sse/", "sse", max_ttfb_ms=600),
     FlushCase("upgrade", "/upgrade/", "upgrade", max_ttfb_ms=0),
+    # chunked-off-tiny: Tier-1 focused production-shape repro per the
+    # migration plan. 50 × 200 B chunks, 50 ms gap, TTFB budget 400 ms.
+    # The existing chunked-off/sse/upgrade cases already discriminate the
+    # bug (they hang on stable HEAD); this tighter variant is the
+    # canonical small-chunk repro for the action-machine flush-promotion
+    # bug from tokers/zstd-nginx-module#23 (mklooss / Stensel8 /
+    # lowkeypriority). xfail (strict=True): goes PASS only after commit
+    # 3 retires the action state machine and adopts ngx_brotli's per-
+    # call-op pattern. strict=True flags any premature pass as failure.
+    pytest.param(
+        FlushCase(
+            "chunked-off-tiny", "/chunked-off-tiny/", "chunked-tiny",
+            max_ttfb_ms=400,
+        ),
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason=(
+                "action-machine flush-promotion bug "
+                "(tokers/zstd-nginx-module#23); closed by per-call-op "
+                "refactor in commit 3 of v2/compress-stream2"
+            ),
+        ),
+    ),
 ]
 
 
-@pytest.mark.parametrize("case", CASES, ids=[c.label for c in CASES])
+def _case_id(c):
+    """Extract label from either a bare FlushCase or a pytest.param-wrapped one."""
+    if isinstance(c, FlushCase):
+        return c.label
+    # pytest.param: .values is the args tuple, first elem is the FlushCase
+    return c.values[0].label
+
+
+@pytest.mark.parametrize("case", CASES, ids=[_case_id(c) for c in CASES])
 def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
     """Issue a single upstream-driven request, byte-compare the decoded
     response against ground truth recorded by the fixture handler.
