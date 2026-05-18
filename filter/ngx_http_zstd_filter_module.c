@@ -21,10 +21,16 @@
  * ZSTD_estimateCStreamSize(level). The bump allocator rounds each
  * sub-allocation up to NGX_ALIGNMENT, which can cost up to
  * (NGX_ALIGNMENT - 1) bytes per call. libzstd makes O(10)
- * sub-allocations during CStream init; (16 * NGX_ALIGNMENT) absorbs
- * the worst case at any platform NGX_ALIGNMENT value with margin.
+ * sub-allocations during CStream init, but some configurations
+ * (CDict refCDict copy-fallback under certain strategy combos,
+ * unusual advanced params, libzstd version drift past the
+ * estimateCStreamSize promise) can push customAlloc demand higher.
+ * (64 * NGX_ALIGNMENT) gives a comfortable safety margin without
+ * meaningfully growing per-request memory (1 KiB on 64-bit Linux).
+ * The fallback branch in ngx_http_zstd_filter_alloc is the last
+ * line of defence and now logs at ALERT so production ops notice.
  */
-#define NGX_HTTP_ZSTD_WORKSPACE_HEADROOM  (16 * NGX_ALIGNMENT)
+#define NGX_HTTP_ZSTD_WORKSPACE_HEADROOM  (64 * NGX_ALIGNMENT)
 
 
 typedef struct {
@@ -1323,9 +1329,17 @@ ngx_http_zstd_filter_alloc(void *opaque, size_t size)
      * 8-byte alignment) keeps subsequent returned pointers aligned for
      * the strictest type libzstd's internals use. If the bump exceeds
      * the budget (libzstd version drift past ZSTD_estimateCStreamSize's
-     * promise), fall back to a pool allocation and emit a WARN so
-     * production can detect estimate drift via log analysis;
-     * test_workspace_no_fallback asserts on this log line.
+     * promise, CDict refCDict copy-fallback, unusual advanced params),
+     * fall back to a pool allocation and log at ALERT. The fallback
+     * chunk lands on r->pool->large and is NOT freed by the eager
+     * ngx_pfree(preallocated) on the done/failed/cleanup paths, so the
+     * Direction A early-release goal is partially defeated for that
+     * request. ALERT level is chosen so production ops alert by default;
+     * a sustained ALERT stream means the headroom in
+     * NGX_HTTP_ZSTD_WORKSPACE_HEADROOM should be raised, or a per-ctx
+     * fallback tracking list added (see plan-followup).
+     * test_workspace_no_fallback asserts the log line stays absent under
+     * the supported config matrix.
      */
     aligned = ngx_align(size, NGX_ALIGNMENT);
     if (aligned <= ctx->allocated) {
@@ -1340,7 +1354,7 @@ ngx_http_zstd_filter_alloc(void *opaque, size_t size)
         return p;
     }
 
-    ngx_log_error(NGX_LOG_WARN, ctx->request->connection->log, 0,
+    ngx_log_error(NGX_LOG_ALERT, ctx->request->connection->log, 0,
                   "zstd workspace exhausted, fallback (req=%uz remaining=%uz)",
                   size, ctx->allocated);
 
@@ -1561,10 +1575,19 @@ ngx_http_zstd_filter_cleanup(void *data)
      * site guaranteed to fire once ctx is installed, so this handler
      * runs ZSTD_freeCStream when the body filter never reached its
      * done/failed branches (upstream finalize, downstream filter
-     * rejection, etc.). The fast path nulls ctx->cstream before pool
-     * teardown so this becomes a no-op. No ngx_pfree on preallocated:
-     * pool teardown reclaims it. See .claude/CLAUDE.md "Filter pipeline"
-     * for the full rationale.
+     * rejection, client RST mid-stream, etc.). The fast path nulls
+     * ctx->cstream before pool teardown so this becomes a no-op.
+     *
+     * No ngx_pfree on ctx->preallocated here: ngx_http_free_request
+     * (src/http/ngx_http_request.c) sets `r->pool = NULL` BEFORE
+     * calling ngx_destroy_pool ("to increase probability to catch
+     * double close of request"), so by the time this pool cleanup
+     * fires, ctx->request->pool is NULL and the chunk pointer needed
+     * by ngx_pfree to walk pool->large is unreachable. The chunk gets
+     * reclaimed microseconds later by ngx_destroy_pool's own
+     * large-list walk; the abort-path symmetry with the fast path's
+     * eager ngx_pfree is intentionally NOT replicated here. See
+     * .claude/CLAUDE.md "Filter pipeline" for the full rationale.
      */
     ngx_http_zstd_ctx_t  *ctx = data;
 
