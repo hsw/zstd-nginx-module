@@ -62,6 +62,29 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   hangs past 10s `ReadTimeoutError`; post-fix it completes within the
   TTFB budget.
 
+### Performance
+
+- Early-release CStream workspace via bump allocator (Direction A).
+  `ngx_http_zstd_filter_create_cstream` now performs a single
+  `ngx_palloc(r->pool, ZSTD_estimateCStreamSize(level) + headroom)`
+  and serves libzstd's `customAlloc` callback from that chunk via a
+  bump pointer, mirroring the nginx gzip filter's allocator pattern
+  (`ngx_http_gzip_filter_module.c:615, 893`). After
+  `ZSTD_freeCStream` returns in the `ctx->done` branch the workspace
+  is released eagerly via `ngx_pfree(r->pool, ctx->preallocated)`;
+  since the workspace exceeds glibc's mmap threshold (~128 KiB) the
+  free returns the pages to the kernel via `munmap` immediately
+  rather than waiting on `r->pool` teardown. A pool cleanup handler
+  registered alongside the CStream is the abort-path safety net:
+  if the request finalizes before `ctx->done` flips (client RST,
+  upstream error, finalize-from-another-module), the handler runs
+  `ZSTD_freeCStream` on the still-alive CStream, mirroring the
+  CDict cleanup pattern from `3a2c597`. Measured impact on the
+  slow-client window: delta-RSS 4148 -> 416 KiB and delta-VSZ 5396 -> 0 KiB
+  (~10x reduction in workspace memory held after compression
+  completes). Commits: `7da62a9` (memory-observation regression
+  test), `2410bba` (implementation).
+
 ### Build
 
 - Minimum libzstd raised to 1.4.0. `ZSTD_compressStream2` requires
@@ -78,7 +101,7 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 ## [Pre-0.3.0 stable]
 
 The `stable` branch carried no `CHANGELOG.md` prior to the 0.3.0 entry above.
-For history before 0.3.0 see the git log on the `stable` branch — notable
+For history before 0.3.0 see the git log on the `stable` branch -- notable
 fixes already shipped there include:
 
 - HTTP/2 silent truncation at the 131072-byte boundary (cherry-pick of upstream PR #49).
