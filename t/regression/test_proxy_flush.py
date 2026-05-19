@@ -393,3 +393,91 @@ def test_proxy_flush(nginx_with_proxy_locations, case: FlushCase, tmp_path):
             f"budget (total={total_ms:.0f}ms) — flush promotion appears not "
             f"to be working; bytes accumulated until upstream close"
         )
+
+
+def test_proxy_flush_slow_client(nginx_with_proxy_locations, tmp_path):
+    """Slow-client back-pressure axis (G1, V2 plan 2026-05-14).
+
+    Throttles the client read pace to ~4 KiB/s while upstream pushes the
+    60 KiB chunked body through the `/chunked-off/` location
+    (proxy_buffering off, b->flush=1 per chunk). Total drain ~15 s.
+
+    What this catches:
+      1. Filter deadlock under TCP send-buffer fullness — would manifest
+         as request timeout. nginx must suspend/resume the request
+         correctly when downstream writes block.
+      2. Eager-`ngx_pfree` from Direction A (commit `f4989ce`) freeing the
+         CStream workspace prematurely — `ctx->done` only flips after
+         libzstd's last byte hits the output chain; under back-pressure
+         that chain hangs until the client drains. A bug there would
+         either corrupt output or SEGV; this test asserts byte-identical
+         roundtrip and clean drain.
+      3. Use-after-free in pool cleanup under client-side slowness — the
+         filter cleanup handler registered alongside `create_cstream` is
+         the abort-path safety net; this test exercises the normal-path
+         done branch while the request stays alive on slow drain.
+
+    Throttling strategy: read in 4 KiB blocks with 1 s sleep between
+    reads. Bypasses urllib3's decode_content for raw zstd frame bytes.
+    The streaming reader's blocking `recv` against the throttled
+    iteration creates the back-pressure naturally — no need for
+    `socket.SO_RCVBUF` tweaks.
+    """
+    import subprocess
+    url = nginx_with_proxy_locations + "/chunked-off/"
+    drain_budget_s = 30.0
+
+    start = time.monotonic()
+    r = requests.get(
+        url,
+        headers={"Accept-Encoding": "zstd"},
+        timeout=drain_budget_s,
+        stream=True,
+    )
+    ttfb_ms: float | None = None
+    body = bytearray()
+    try:
+        for chunk in r.raw.stream(amt=4096, decode_content=False):
+            if chunk:
+                if ttfb_ms is None:
+                    ttfb_ms = (time.monotonic() - start) * 1000.0
+                body.extend(chunk)
+                # Throttle: ~4 KiB per 1 s = 4 KiB/s.
+                time.sleep(1.0)
+    finally:
+        r.close()
+    total_s = time.monotonic() - start
+
+    assert r.headers.get("Content-Encoding") == "zstd", (
+        f"Content-Encoding={r.headers.get('Content-Encoding')!r}, expected zstd"
+    )
+    assert bytes(body[:4]) == b"\x28\xb5\x2f\xfd", (
+        f"response missing zstd magic; hex={bytes(body[:16]).hex()}"
+    )
+
+    zst_path = tmp_path / "slow-client.zst"
+    zst_path.write_bytes(bytes(body))
+    dec = subprocess.run(
+        ["zstd", "-dc", str(zst_path)],
+        capture_output=True, check=False,
+    )
+    assert dec.returncode == 0, (
+        f"zstd -d failed under slow drain: {dec.stderr.decode(errors='replace')}"
+    )
+
+    with GROUND_TRUTH_LOCK:
+        truth = GROUND_TRUTH.get("chunked")
+    assert truth is not None, "fixture handler did not record /chunked ground truth"
+    assert dec.stdout == truth, (
+        f"decoded differs from upstream under back-pressure: "
+        f"truth={len(truth)}B vs dec={len(dec.stdout)}B"
+    )
+
+    # Sanity: the drain must actually be slow-client-shaped. With a 60 KiB
+    # body throttled at ~4 KiB/s the total wall-clock should be at least
+    # several seconds. If it completes in <2 s, urllib3 buffered everything
+    # ahead of the sleep loop and we did not exercise back-pressure.
+    assert total_s >= 5.0, (
+        f"drain finished in {total_s:.1f}s — throttle was bypassed "
+        f"(urllib3 buffered the whole response). Test invalid."
+    )
