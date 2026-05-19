@@ -91,7 +91,12 @@ run_variant() {
     local var_log_dir="${LOG_DIR}/${variant}"
     mkdir -p "$var_log_dir"
 
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    # Use `docker images -q` (not `docker image inspect`) for the presence
+    # check: under Docker Desktop's containerd-snapshotter, `image inspect`
+    # by name:tag returns "No such image" for buildkit-produced multi-arch
+    # manifest entries even when the image is fully usable via `docker run`.
+    # `images -q` resolves the tag correctly in both stores.
+    if [ -z "$(docker images -q "$image" 2>/dev/null)" ]; then
         echo "run.sh: image ${image} not found — run t/build.sh ${variant} first" >&2
         variant_inc_fail "$variant"
         SUMMARY_LINES+=("${variant}/<image-missing>: fail")
