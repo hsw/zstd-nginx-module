@@ -83,12 +83,17 @@ if [ "$MODE" = "dynamic" ]; then
     done
     CONFIGURE_ARGS+=(--add-dynamic-module="$MODULE_SRC")
 else
-    # static build pulls in http_ssl + http_v2 so a realistic nginx is
-    # produced; the gzip filter is on by default so filter/config's
-    # filter-priority sed can exercise brotli > zstd > gzip ordering at
-    # link time. http_v2 makes the brotli variant usable by pytest
-    # test_h2_truncation / test_http2_proxy_flush (they skip otherwise).
-    CONFIGURE_ARGS+=(--with-http_ssl_module --with-http_v2_module)
+    # static build pulls in http_ssl + http_v2 + http_gzip_static so a
+    # realistic nginx is produced. gzip filter is on by default —
+    # filter/config's filter-priority sed exercises brotli > zstd > gzip
+    # ordering at link time. http_gzip_static lets the static brotli
+    # image carry a complete encoder/handler set (.zst + .br + .gz
+    # sidecars) and matches the nginx.org apt mainline default used by
+    # the dynamic variants — so the production-traffic matrix in
+    # test_static_brotli_priority.py asserts identical outcomes on both
+    # image classes. http_v2 makes the brotli variant usable by pytest
+    # test_h2_truncation / test_http2_proxy_flush.
+    CONFIGURE_ARGS+=(--with-http_ssl_module --with-http_v2_module --with-http_gzip_static_module)
     for extra in "$@"; do
         CONFIGURE_ARGS+=(--add-module="$extra")
     done

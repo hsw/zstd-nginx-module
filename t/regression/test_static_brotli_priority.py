@@ -27,6 +27,7 @@ FIXTURE_DIR = Path("/var/fixtures/static-priority")
 PLAIN_FILE = FIXTURE_DIR / "sample"
 ZST_SIDECAR = FIXTURE_DIR / "sample.zst"
 BR_SIDECAR = FIXTURE_DIR / "sample.br"
+GZ_SIDECAR = FIXTURE_DIR / "sample.gz"
 
 
 def _has_brotli() -> bool:
@@ -67,8 +68,13 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def static_priority_nginx():
-    """Build a fixture with both .zst and .br precompressed sidecars,
-    serve from a location that enables both zstd_static and brotli_static."""
+    """Build a fixture with .zst, .br AND .gz precompressed sidecars,
+    served from a location that enables all three static modules. nginx
+    is built with --with-http_gzip_static_module (apt nginx.org mainline
+    enables it by default; our custom static build at build-module.sh
+    explicitly requests it). The full three-encoder fixture lets the
+    production-traffic matrix below assert real gzip outcomes instead
+    of plain-fallback on gzip-only AE clients (~10% of traffic)."""
     FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
     PLAIN_FILE.write_bytes(b"S" * 8192)
     subprocess.run(
@@ -78,10 +84,12 @@ def static_priority_nginx():
         ["brotli", "-q", "11", "-f", str(PLAIN_FILE), "-o", str(BR_SIDECAR)],
         check=True,
     )
+    # gzip CLI doesn't take -o; write via stdout redirect.
+    with GZ_SIDECAR.open("wb") as fh:
+        subprocess.run(
+            ["gzip", "-9", "-c", str(PLAIN_FILE)], check=True, stdout=fh,
+        )
 
-    # gzip_static directive intentionally omitted — this nginx build doesn't
-    # include --with-http_gzip_static_module. The test surface is zstd_static
-    # vs brotli_static priority, which is sufficient for Issue #40 coverage.
     extra_directives = "brotli_static on;"
     extra_locations = """
         location /both-static/ {
@@ -89,6 +97,7 @@ def static_priority_nginx():
             zstd_static on;
             brotli off;
             brotli_static on;
+            gzip_static on;
             alias /var/fixtures/static-priority/;
             default_type application/octet-stream;
         }
@@ -161,13 +170,10 @@ def test_plain_served_when_neither_accepted(static_priority_nginx):
 
 # Top-10 real-world Accept-Encoding strings observed in L1 webfront
 # traffic over a 24h window (~20B requests). Same source as the matching
-# matrix in test_filter_priority.py — but the expected outcomes differ
-# because the static handler chain depends on which sidecars exist on
-# disk and which static modules are compiled in. Our brotli image
-# includes zstd_static + brotli_static but NOT --with-http_gzip_static_module,
-# and the /both-static/ fixture only creates .zst + .br sidecars (no .gz).
-# So any client offering only gzip/deflate falls through to the plain
-# file (Content-Encoding header absent).
+# matrix in test_filter_priority.py. Static handler chain choice is
+# zstd_static > brotli_static > gzip_static > ngx_http_static_module —
+# the operator-declared module priority via ngx_module_order (dynamic
+# builds) and HTTP_MODULES sed-rewrite (static builds).
 PRODUCTION_CASES_STATIC = [
     # rank 1 — 30.9%: zstd offered + sidecar exists → zstd_static
     ("prod-01-all-four",       "gzip, deflate, br, zstd",       "zstd"),
@@ -175,20 +181,19 @@ PRODUCTION_CASES_STATIC = [
     ("prod-02-br-gzip",        "br, gzip",                      "br"),
     # rank 3 — 10.7%: same shape, br_static serves .br
     ("prod-03-gzip-defl-br",   "gzip, deflate, br",             "br"),
-    # rank 4 — 9.2%: gzip-only client. No .gz sidecar + no
-    # gzip_static module → fall through to plain
-    ("prod-04-gzip-only",      "gzip",                          None),
+    # rank 4 — 9.2%: gzip-only client → gzip_static serves .gz
+    ("prod-04-gzip-only",      "gzip",                          "gzip"),
     # rank 5 — 6.9%: empty AE → no static module activates → plain
     ("prod-05-empty",          "",                              None),
     # rank 6 — 5.7%: zstd not offered, br_static wins
     ("prod-06-gzip-br",        "gzip, br",                      "br"),
     # rank 7 — 3.7%: zero-OWS comma between br and gzip; br_static wins
     ("prod-07-br-gzip-no-ows", "br,gzip",                       "br"),
-    # rank 8 — 1.0%: no sidecar for gzip/deflate → plain
-    ("prod-08-gzip-defl",      "gzip, deflate",                 None),
-    # rank 9 — 0.94%: x-gzip is the gzip synonym; we have no .gz
-    # sidecar in this fixture → plain
-    ("prod-09-gzip-xgzip",     "gzip, x-gzip, deflate",         None),
+    # rank 8 — 1.0%: gzip-only (deflate ignored) → gzip_static
+    ("prod-08-gzip-defl",      "gzip, deflate",                 "gzip"),
+    # rank 9 — 0.94%: x-gzip is the gzip synonym; nginx core
+    # gzip_static treats it as gzip → gzip_static
+    ("prod-09-gzip-xgzip",     "gzip, x-gzip, deflate",         "gzip"),
     # rank 10 — 0.78%: sdch ignored, zstd present → zstd_static
     ("prod-10-all-plus-sdch",  "gzip, deflate, br, zstd, sdch", "zstd"),
 ]
@@ -213,10 +218,9 @@ def test_static_priority_production_traffic(
 
     Notable shapes covered:
       * `br,gzip` with no OWS between tokens (3.7% of traffic).
-      * `gzip, x-gzip, deflate` — x-gzip ignored, falls through.
-      * gzip-only client (9.2%) — no .gz sidecar in our fixture so
-        falls through to plain; in a real deployment with gzip_static
-        + .gz sidecars this would be Content-Encoding: gzip.
+      * `gzip, x-gzip, deflate` (0.94%) — x-gzip is the RFC 9110 gzip
+        synonym; nginx gzip_static accepts it.
+      * gzip-only client (9.2%) — gzip_static serves the .gz sidecar.
       * Empty AE header (6.9%) — no sidecar activates → plain.
     """
     r, body = http_request(
@@ -226,14 +230,10 @@ def test_static_priority_production_traffic(
     assert r.status_code == 200, f"[{label}] HTTP {r.status_code}"
     actual_ce = r.headers.get("Content-Encoding")
     if expected_ce is None:
-        assert actual_ce not in ("zstd", "br"), (
+        assert actual_ce not in ("zstd", "br", "gzip"), (
             f"[{label}] AE={accept_encoding!r}: expected plain, got "
             f"Content-Encoding={actual_ce!r}"
         )
-        # In our build, "not zstd not br" actually means absent (no
-        # gzip_static module to set it). Double-check the body matches
-        # the plain file so a transparent passthrough of e.g. a stale
-        # cached encoded body would still fail.
         assert body == PLAIN_FILE.read_bytes(), (
             f"[{label}] AE={accept_encoding!r}: expected plain bytes, "
             f"got {len(body)} bytes (plain is {PLAIN_FILE.stat().st_size})"
@@ -244,10 +244,11 @@ def test_static_priority_production_traffic(
             f"Content-Encoding={expected_ce!r}, got {actual_ce!r}; "
             f"all headers: {dict(r.headers)}"
         )
-        expected_body = (
-            ZST_SIDECAR.read_bytes() if expected_ce == "zstd"
-            else BR_SIDECAR.read_bytes()
-        )
+        expected_body = {
+            "zstd": ZST_SIDECAR,
+            "br":   BR_SIDECAR,
+            "gzip": GZ_SIDECAR,
+        }[expected_ce].read_bytes()
         assert body == expected_body, (
             f"[{label}] AE={accept_encoding!r}: served body mismatched "
             f"sidecar — possible content-handler / load-module-order bug"
