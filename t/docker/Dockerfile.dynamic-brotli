@@ -1,0 +1,110 @@
+# Dockerfile.dynamic-brotli — DYNAMIC build of both ngx_brotli and the
+# zstd module, loaded via `load_module` directives against the
+# apt-installed nginx.org mainline binary (which is shipped with
+# --with-compat). Closes the dynamic-build coverage gap for Issue #40 /
+# PR #44: ngx_module_order in our filter/config and static/config must
+# outrank brotli for `load_module`-loaded modules too, not only for
+# --add-module static builds (where the HTTP_FILTER_MODULES /
+# HTTP_MODULES sed-rewrite is the mechanism instead).
+#
+# Companion to Dockerfile.brotli (static build, exercises sed-rewrite).
+# Single-stage on purpose; this is a test image, not a distributable.
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build deps + ngx_brotli build deps (git, cmake, g++ for its
+# encoder/decoder cmake submodules). Runtime libs (libpcre2-8, libssl3,
+# libbrotli1, libzstd1, zlib1g) come transitively from the -dev packages.
+RUN apt-get update \
+ && apt-get install -y \
+        curl ca-certificates gnupg lsb-release \
+        build-essential libpcre2-dev libssl-dev zlib1g-dev libzstd-dev libbrotli-dev \
+        zstd brotli python3 python3-venv python3-pip wget pkg-config git cmake g++ \
+ && curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg \
+ && CODENAME=$(lsb_release -cs) \
+ && echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://nginx.org/packages/mainline/ubuntu/ ${CODENAME} nginx" > /etc/apt/sources.list.d/nginx.list \
+ && printf 'Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n' > /etc/apt/preferences.d/99nginx \
+ && apt-get update && apt-get install -y nginx \
+ && rm -rf /var/lib/apt/lists/*
+
+# Match nginx source to installed mainline version, identical to
+# Dockerfile.dynamic — same source tree, same flags, just additional
+# --add-dynamic-module entries.
+RUN NGINX_VERSION=$(/usr/sbin/nginx -v 2>&1 | sed 's|.*nginx/||' | sed 's|[[:space:]].*||') \
+ && curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" -o /tmp/nginx.tar.gz \
+ && mkdir -p /usr/local/src \
+ && tar -C /usr/local/src -xzf /tmp/nginx.tar.gz \
+ && ln -s "/usr/local/src/nginx-${NGINX_VERSION}" /usr/local/src/nginx \
+ && rm -f /tmp/nginx.tar.gz
+
+# Pin ngx_brotli to a ref for reproducibility (default master; override
+# at build time with --build-arg NGX_BROTLI_REF=...). Submodules pull in
+# the google/brotli C library used by the encoder.
+ARG NGX_BROTLI_REF=master
+RUN git clone --recurse-submodules --depth 1 --branch "${NGX_BROTLI_REF}" \
+        https://github.com/google/ngx_brotli.git /src/ngx_brotli
+
+# Build both modules as dynamic .so. Module order matters: ngx_brotli is
+# added BEFORE the main zstd module so that filter/config and
+# static/config (in the zstd module) see ngx_brotli's modules already
+# present at configure time and their `ngx_module_order` declaration
+# pins zstd AFTER brotli in the merged module list. Same rationale as
+# the Dockerfile.brotli static build, just via ngx_module_order instead
+# of the sed-rewrite mechanism.
+COPY config /src/zstd-nginx-module/config
+COPY filter /src/zstd-nginx-module/filter
+COPY static /src/zstd-nginx-module/static
+COPY t/docker/build-module.sh /src/zstd-nginx-module/t/docker/build-module.sh
+RUN /src/zstd-nginx-module/t/docker/build-module.sh \
+        /usr/local/src/nginx \
+        /src/zstd-nginx-module \
+        dynamic \
+        /src/ngx_brotli \
+ && mkdir -p /etc/nginx/modules \
+ && cp /usr/local/src/nginx/objs/*.so /etc/nginx/modules/
+
+# Sanity: all four .so were built and installed.
+RUN ls /etc/nginx/modules/ngx_http_brotli_filter_module.so \
+       /etc/nginx/modules/ngx_http_brotli_static_module.so \
+       /etc/nginx/modules/ngx_http_zstd_filter_module.so \
+       /etc/nginx/modules/ngx_http_zstd_static_module.so
+
+RUN mkdir -p /var/cache/nginx \
+             /var/fixtures/random /tmp/client_body /tmp/proxy /tmp/fastcgi /tmp/uwsgi /tmp/scgi
+
+# Pinned Python test deps in a venv. Placed after the module build so
+# test-dep changes don't invalidate the build cache.
+COPY t/docker/requirements.txt /opt/requirements.txt
+RUN python3 -m venv /opt/test-venv \
+ && /opt/test-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/test-venv/bin/pip install --no-cache-dir -r /opt/requirements.txt
+ENV PATH=/opt/test-venv/bin:$PATH
+
+# Self-signed cert for HTTP/2 tests (httpx needs TLS+ALPN for h2).
+RUN openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout /etc/nginx/test-key.pem \
+        -out /etc/nginx/test-cert.pem \
+        -days 3650 -subj "/CN=test" 2>/dev/null \
+ && chmod 0644 /etc/nginx/test-key.pem /etc/nginx/test-cert.pem
+
+COPY t/docker/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+COPY t/regression /opt/regression
+
+# Dynamic build: render a default nginx.conf that load_modules all four
+# .so (brotli + zstd, both filter and static), plus enables brotli on so
+# the baseline `CMD ["nginx"]` exercises the full chain even before
+# regression-specific re-rendering. The leading newline + 4-space indent
+# inside the substitution keeps the rendered conf readable.
+RUN sed \
+        -e 's|^__LOAD_MODULES__$|load_module modules/ngx_http_brotli_filter_module.so;\nload_module modules/ngx_http_brotli_static_module.so;\nload_module modules/ngx_http_zstd_filter_module.so;\nload_module modules/ngx_http_zstd_static_module.so;|' \
+        -e 's|__EXTRA_DIRECTIVES__|brotli on; brotli_min_length 0; brotli_types *;|' \
+        -e 's|__EXTRA_SERVER__||' \
+        -e 's|__EXTRA_LOCATIONS__||' \
+        -e 's|__SERVER_PORT__|8080|' \
+        /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf
+
+EXPOSE 8080
+CMD ["nginx"]

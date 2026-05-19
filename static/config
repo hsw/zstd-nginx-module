@@ -112,12 +112,19 @@ ngx_module_incs="$ngx_zstd_opt_I"
 ngx_module_srcs=$HTTP_ZSTD_SRCS
 # Module-order: zstd_static wins over brotli_static / gzip_static when a
 # resource has multiple precompressed sidecars and the client accepts more
-# than one encoding. Matches the filter-side precedence (filter/config:112)
-# so static and on-the-fly paths agree on which encoding to serve.
-# Closes upstream tokers/zstd-nginx-module#40 (mklooss).
-ngx_module_order="$ngx_module_name \
+# than one encoding. Closes upstream tokers/zstd-nginx-module#40 (mklooss).
+#
+# ngx_module_order semantics: the first name comes BEFORE the rest in the
+# generated ngx_modules[] array. nginx reverses content-phase handlers in
+# ngx_http_init_phase_handlers (src/http/ngx_http.c:551) — LIFO chain —
+# so a module at a HIGHER ngx_modules[] index has its handler called
+# FIRST at request time. To make zstd_static win we therefore need it at
+# the END of this list, after every static-module sibling that might
+# otherwise outrank it.
+ngx_module_order="ngx_http_static_module \
+                  ngx_http_gzip_static_module \
                   ngx_http_brotli_static_module \
-                  ngx_http_gzip_static_module"
+                  $ngx_module_name"
 
 . auto/module
 

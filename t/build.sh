@@ -26,6 +26,7 @@ ALL_VARIANTS=(
     ubuntu-24.04-shared-only
     ubuntu-26.04
     ubuntu-24.04-brotli
+    ubuntu-24.04-dynamic-brotli
 )
 # angie-{22.04,24.04,26.04} variants exist as on-demand targets in the
 # case-dispatch below — built explicitly via `bash t/build.sh angie-24.04`
@@ -73,6 +74,10 @@ for v in "${VARIANTS[@]}"; do
             ;;
         ubuntu-24.04-brotli)
             dockerfile="t/docker/Dockerfile.brotli"
+            build_args=(--build-arg UBUNTU_VERSION=24.04)
+            ;;
+        ubuntu-24.04-dynamic-brotli)
+            dockerfile="t/docker/Dockerfile.dynamic-brotli"
             build_args=(--build-arg UBUNTU_VERSION=24.04)
             ;;
         angie-22.04)

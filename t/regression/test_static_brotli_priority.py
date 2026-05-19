@@ -30,14 +30,38 @@ BR_SIDECAR = FIXTURE_DIR / "sample.br"
 
 
 def _has_brotli() -> bool:
+    """Static-build: ngx_brotli is linked in (nginx -V shows it).
+    Dynamic-build: ngx_brotli .so present in /etc/nginx/modules.
+    Either is acceptable for the test."""
     out = subprocess.run(
         ["nginx", "-V"], capture_output=True, text=True, check=False
     )
-    return "ngx_brotli" in (out.stdout + out.stderr)
+    if "ngx_brotli" in (out.stdout + out.stderr):
+        return True
+    return Path("/etc/nginx/modules/ngx_http_brotli_filter_module.so").exists()
+
+
+def _brotli_load_modules() -> str:
+    """load_module lines for the dynamic-brotli image; empty for static."""
+    nv = subprocess.run(
+        ["nginx", "-V"], capture_output=True, text=True, check=False,
+    )
+    if "ngx_brotli" in (nv.stdout + nv.stderr):
+        return ""
+    parts = []
+    for name in (
+        "ngx_http_brotli_filter_module.so",
+        "ngx_http_brotli_static_module.so",
+        "ngx_http_zstd_filter_module.so",
+        "ngx_http_zstd_static_module.so",
+    ):
+        if Path(f"/etc/nginx/modules/{name}").exists():
+            parts.append(f"load_module modules/{name};")
+    return "\n    ".join(parts)
 
 
 pytestmark = pytest.mark.skipif(
-    not _has_brotli(), reason="nginx not built with ngx_brotli"
+    not _has_brotli(), reason="nginx without ngx_brotli (neither linked nor loadable)"
 )
 
 
@@ -73,7 +97,7 @@ def static_priority_nginx():
     render_template(
         extra_directives=extra_directives,
         extra_locations=extra_locations,
-        load_modules="",
+        load_modules=_brotli_load_modules(),
     )
     start_nginx()
     try:

@@ -36,6 +36,7 @@ ALL_VARIANTS=(
     ubuntu-24.04-shared-only
     ubuntu-26.04
     ubuntu-24.04-brotli
+    ubuntu-24.04-dynamic-brotli
 )
 
 if [ "$#" -gt 0 ]; then

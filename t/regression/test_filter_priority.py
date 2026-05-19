@@ -18,6 +18,7 @@ Module-skipped on non-brotli builds via `nginx -V | grep ngx_brotli`.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -25,27 +26,62 @@ from conftest import BASE_URL, http_request, render_template, start_nginx, stop_
 
 
 def _has_brotli() -> bool:
-    """Mirror the bash gate: `nginx -V | grep ngx_brotli`. Only the brotli
-    image satisfies; everything else skips the whole module."""
+    """Detect whether this nginx supports brotli. Two valid paths:
+      * static build (ubuntu-24.04-brotli) — `nginx -V` lists ngx_brotli
+      * dynamic build (ubuntu-24.04-dynamic-brotli) — brotli .so present
+        in /etc/nginx/modules and loaded via load_module at runtime
+    """
     out = subprocess.run(
         ["nginx", "-V"], capture_output=True, text=True, check=False
     )
-    return "ngx_brotli" in (out.stdout + out.stderr)
+    if "ngx_brotli" in (out.stdout + out.stderr):
+        return True
+    return Path("/etc/nginx/modules/ngx_http_brotli_filter_module.so").exists()
+
+
+def _brotli_load_modules() -> str:
+    """Return the load_module lines needed when running the brotli combo
+    tests. Empty string on the static build (everything is linked into
+    the nginx binary); on the dynamic-brotli build, load brotli + zstd
+    filter + static modules so the test fixture renders a config that
+    nginx -t accepts.
+
+    Module load order in the directive does NOT control ngx_modules[]
+    ordering — that's owned by `ngx_module_order` declared in each
+    module's `config` file. We still write them in brotli-then-zstd
+    order to keep the rendered conf self-documenting.
+    """
+    nv = subprocess.run(
+        ["nginx", "-V"], capture_output=True, text=True, check=False,
+    )
+    if "ngx_brotli" in (nv.stdout + nv.stderr):
+        return ""  # static build, modules linked in
+    parts = []
+    for name in (
+        "ngx_http_brotli_filter_module.so",
+        "ngx_http_brotli_static_module.so",
+        "ngx_http_zstd_filter_module.so",
+        "ngx_http_zstd_static_module.so",
+    ):
+        if Path(f"/etc/nginx/modules/{name}").exists():
+            parts.append(f"load_module modules/{name};")
+    return "\n    ".join(parts)
 
 
 pytestmark = pytest.mark.skipif(
-    not _has_brotli(), reason="nginx not built with ngx_brotli"
+    not _has_brotli(), reason="nginx without ngx_brotli (neither linked nor loadable)"
 )
 
 
 @pytest.fixture(scope="module")
 def brotli_nginx():
-    """Render config with brotli enabled inline (static build: no
-    load_module line; brotli must be turned on via directives)."""
+    """Render config with brotli enabled inline. Loads brotli+zstd
+    modules dynamically on the dynamic-brotli image; no load_module
+    lines on the static-brotli image (modules linked into the binary)."""
     stop_nginx()
     render_template(
         extra_directives="brotli on; brotli_min_length 0; brotli_types *;",
-        load_modules="",  # static brotli build links everything in — no .so loads.
+        load_modules=_brotli_load_modules(),
     )
     start_nginx()
     try:
