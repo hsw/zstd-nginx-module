@@ -45,10 +45,13 @@ is dominated by glibc heuristics, not by the fix itself.
 
 from __future__ import annotations
 
+import asyncio
+import os
 import socket
 import time
 from pathlib import Path
 
+import httpx
 import pytest
 import requests
 
@@ -65,6 +68,12 @@ from conftest import (
 WORKSPACE_FIXTURE_DIR = Path("/var/fixtures/workspace")
 COMPRESSIBLE_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
 COMPRESSIBLE_BODY_NAME = "compressible-1mb.bin"
+# Incompressible body — random bytes. Used by the concurrent OOM-guard
+# test so each response stays ~1 MB after compression (vs. ~177 B for the
+# repetitive compressible fixture). Slow drain × concurrency only
+# exercises workspace lifetime if drain takes nontrivial wall-clock.
+INCOMPRESSIBLE_BODY_SIZE = 1 * 1024 * 1024  # 1 MB
+INCOMPRESSIBLE_BODY_NAME = "incompressible-1mb.bin"
 
 
 def _master_pid() -> int:
@@ -105,12 +114,28 @@ def _ensure_compressible_body() -> Path:
     return body
 
 
+def _ensure_incompressible_body() -> Path:
+    """Write a deterministic incompressible 1 MB body fixture once per
+    session. Uses a fixed seed so the fixture is reproducible across
+    runs. Random bytes compress to ~equal-size output at any level,
+    which is what makes the slow-drain test exercise workspace lifetime
+    rather than blasting through a 177-byte compressed payload."""
+    import random
+    WORKSPACE_FIXTURE_DIR.mkdir(parents=True, exist_ok=True)
+    body = WORKSPACE_FIXTURE_DIR / INCOMPRESSIBLE_BODY_NAME
+    if not body.exists() or body.stat().st_size != INCOMPRESSIBLE_BODY_SIZE:
+        rng = random.Random(0xC57DA)  # deterministic
+        body.write_bytes(rng.randbytes(INCOMPRESSIBLE_BODY_SIZE))
+    return body
+
+
 @pytest.fixture(scope="module")
 def workspace_nginx():
     """Module-scoped nginx with zstd_comp_level 6 (largest workspace in
     the default test matrix configuration -- ~5.5 MB per ZSTD_estimateCStreamSize)
     and a /workspace/ location aliased to a 1 MB compressible fixture body."""
     _ensure_compressible_body()
+    _ensure_incompressible_body()
     stop_nginx()
     render_template(
         extra_directives="zstd_comp_level 6;",
@@ -237,6 +262,143 @@ def test_workspace_memory_observed(workspace_nginx):
     # Sanity only -- samples succeeded, request hit the compression path.
     assert rss_t0 > 0 and rss_t1 > 0 and rss_t2 > 0, (
         f"VmRSS sampling failed: T0={rss_t0}, T1={rss_t1}, T2={rss_t2}"
+    )
+
+
+def test_concurrent_workspace_pinning_oom_guard(workspace_nginx):
+    """Issue #18 class regression: workspace pinning under concurrent
+    slow-drain clients must NOT accumulate across the in-flight window.
+
+    Drives N concurrent async httpx clients, each slow-draining the
+    incompressible 1 MB fixture at ~100 KiB/s (4 KiB chunks every 40 ms).
+    Each request therefore holds an open response for ~10 s while libzstd
+    has long finished compressing -- exactly the window Direction A
+    targets.
+
+    Memory math at zstd_comp_level 6 (workspace ~5.5 MB per
+    ZSTD_estimateCStreamSize(6)):
+
+      pre-Direction-A path: workspace pinned in r->pool->large until
+        request_pool teardown. Slow drain delays teardown by ~10 s.
+        Peak per-worker memory = N x 5.5 MB held simultaneously.
+        N=200 -> ~1.1 GB workspace pinned.
+
+      post-Direction-A path: workspace ngx_pfree'd as soon as ctx->done
+        flips inside the body filter (~50 ms after compression starts;
+        well before the client drain completes). Peak workspace memory
+        collapses to roughly the number of concurrent in-flight
+        compressions (CPU-bound, ~ncpu) instead of N.
+
+    Discriminative under --memory: run inside
+
+        docker run --rm --memory=768m --memory-swap=768m \\
+            zstd-nginx-test:ubuntu-24.04 \\
+            pytest .../test_workspace_rss.py::\\
+                test_concurrent_workspace_pinning_oom_guard
+
+    768 MiB is enough for post-fix (workspace freed before drain peak,
+    only output chain buffers + nginx baseline remain) but not for
+    pre-fix (~1.1 GB pinned workspace + nginx ~> 1.2 GB total -> OOM
+    kills the worker, surfacing as a 5xx wave on the open connections).
+
+    Without --memory the test still passes correctness assertions
+    (zstd magic, byte length, no upstream exceptions) but won't
+    discriminate the pinning regression.
+
+    Test sizing rationale:
+      * N=200 -- smallest concurrency that exposes the pre-fix
+        workspace accumulation deterministically (mklooss's original
+        ab repro was -c 1000 -n 200000; we exercise the same bug class
+        in a smaller, deterministic, ~12 s test).
+      * 100 KiB/s drain rate -- slow enough that drain >> compression,
+        fast enough that body completes within timeout. Drives 1 MB
+        body over ~10 s, leaving ~20 s headroom against the 30 s
+        per-request timeout.
+      * Incompressible body -- guarantees response is ~1 MB after
+        compression (random content), keeping drain time deterministic.
+        A compressible body would shrink to ~177 B and drain in one
+        chunk, defeating the slow-drain shape.
+    """
+    concurrency = int(os.environ.get("ZSTD_CONCURRENCY", "200"))
+    drain_rate_kib_s = 100  # 4 KiB every 40 ms
+    chunk_size = 4096
+    sleep_per_chunk_s = chunk_size / (drain_rate_kib_s * 1024)
+    per_request_timeout_s = 30.0
+    url = f"{workspace_nginx}/workspace/{INCOMPRESSIBLE_BODY_NAME}"
+
+    async def slow_drain_request(client: httpx.AsyncClient) -> int:
+        # stream + aiter_raw bypasses httpx's auto-zstd decoder. We need
+        # the raw zstd frame bytes to validate end-to-end response shape
+        # (a regression where the filter fails open and emits plaintext
+        # with Content-Encoding: zstd would be silently decoded).
+        async with client.stream(
+            "GET", url, headers={"Accept-Encoding": "zstd"},
+        ) as r:
+            assert r.status_code == 200, f"status={r.status_code}"
+            assert r.headers.get("content-encoding") == "zstd", (
+                f"ce={r.headers.get('content-encoding')!r}"
+            )
+            body = bytearray()
+            async for chunk in r.aiter_raw(chunk_size=chunk_size):
+                body.extend(chunk)
+                await asyncio.sleep(sleep_per_chunk_s)
+        assert bytes(body[:4]) == b"\x28\xb5\x2f\xfd", (
+            f"missing zstd magic; first16={bytes(body[:16]).hex()}"
+        )
+        return len(body)
+
+    async def run_all() -> list:
+        limits = httpx.Limits(
+            max_connections=concurrency + 10,
+            max_keepalive_connections=concurrency + 10,
+        )
+        async with httpx.AsyncClient(
+            timeout=per_request_timeout_s, limits=limits,
+        ) as client:
+            return await asyncio.gather(
+                *(slow_drain_request(client) for _ in range(concurrency)),
+                return_exceptions=True,
+            )
+
+    start = time.monotonic()
+    results = asyncio.run(run_all())
+    elapsed_s = time.monotonic() - start
+
+    failures = [r for r in results if isinstance(r, BaseException)]
+    assert not failures, (
+        f"{len(failures)}/{concurrency} slow-drain requests failed.\n"
+        f"First 3 errors: "
+        f"{[type(f).__name__ + ': ' + str(f)[:200] for f in failures[:3]]}\n"
+        f"Probable causes: (a) worker OOM-killed because workspace "
+        f"pinning regressed and memory limit was insufficient; (b) "
+        f"filter SEGV under concurrent customAlloc; (c) connection "
+        f"reset because send_timeout fired during slow drain."
+    )
+
+    sizes = sorted(results)
+    # Incompressible body: post-compression size should be within ~10% of
+    # input. Anything significantly smaller means the body wasn't actually
+    # randomised (regression in the fixture generator).
+    assert sizes[0] > 900_000, (
+        f"smallest response only {sizes[0]} bytes -- fixture is not "
+        f"incompressible; the test isn't exercising the slow-drain shape"
+    )
+
+    # Sanity on drain shape: at 100 KiB/s drain rate, 1 MB takes ~10 s,
+    # and 200 concurrent under asyncio drain in roughly that wall-clock
+    # (highly parallel). If elapsed << expected, the rate-limit didn't
+    # bite -- likely httpx buffered, or the slow-drain sleep wasn't
+    # gating the next recv. Floor: 5 s (half of nominal).
+    assert elapsed_s >= 5.0, (
+        f"drain completed in {elapsed_s:.1f}s for {concurrency} x "
+        f"{INCOMPRESSIBLE_BODY_SIZE}B requests at {drain_rate_kib_s} "
+        f"KiB/s -- throttle was bypassed."
+    )
+
+    print(
+        f"\n[concurrent] {concurrency} slow-drain requests in "
+        f"{elapsed_s:.1f}s, drain rate {drain_rate_kib_s} KiB/s, "
+        f"response sizes {sizes[0]}..{sizes[-1]} bytes"
     )
 
 
