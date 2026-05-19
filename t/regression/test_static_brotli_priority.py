@@ -157,3 +157,98 @@ def test_plain_served_when_neither_accepted(static_priority_nginx):
         f"expected plain (neither zstd nor br accepted)"
     )
     assert body == PLAIN_FILE.read_bytes()
+
+
+# Top-10 real-world Accept-Encoding strings observed in L1 webfront
+# traffic over a 24h window (~20B requests). Same source as the matching
+# matrix in test_filter_priority.py — but the expected outcomes differ
+# because the static handler chain depends on which sidecars exist on
+# disk and which static modules are compiled in. Our brotli image
+# includes zstd_static + brotli_static but NOT --with-http_gzip_static_module,
+# and the /both-static/ fixture only creates .zst + .br sidecars (no .gz).
+# So any client offering only gzip/deflate falls through to the plain
+# file (Content-Encoding header absent).
+PRODUCTION_CASES_STATIC = [
+    # rank 1 — 30.9%: zstd offered + sidecar exists → zstd_static
+    ("prod-01-all-four",       "gzip, deflate, br, zstd",       "zstd"),
+    # rank 2 — 28.9%: zstd not offered, br_static serves .br
+    ("prod-02-br-gzip",        "br, gzip",                      "br"),
+    # rank 3 — 10.7%: same shape, br_static serves .br
+    ("prod-03-gzip-defl-br",   "gzip, deflate, br",             "br"),
+    # rank 4 — 9.2%: gzip-only client. No .gz sidecar + no
+    # gzip_static module → fall through to plain
+    ("prod-04-gzip-only",      "gzip",                          None),
+    # rank 5 — 6.9%: empty AE → no static module activates → plain
+    ("prod-05-empty",          "",                              None),
+    # rank 6 — 5.7%: zstd not offered, br_static wins
+    ("prod-06-gzip-br",        "gzip, br",                      "br"),
+    # rank 7 — 3.7%: zero-OWS comma between br and gzip; br_static wins
+    ("prod-07-br-gzip-no-ows", "br,gzip",                       "br"),
+    # rank 8 — 1.0%: no sidecar for gzip/deflate → plain
+    ("prod-08-gzip-defl",      "gzip, deflate",                 None),
+    # rank 9 — 0.94%: x-gzip is the gzip synonym; we have no .gz
+    # sidecar in this fixture → plain
+    ("prod-09-gzip-xgzip",     "gzip, x-gzip, deflate",         None),
+    # rank 10 — 0.78%: sdch ignored, zstd present → zstd_static
+    ("prod-10-all-plus-sdch",  "gzip, deflate, br, zstd, sdch", "zstd"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,accept_encoding,expected_ce",
+    PRODUCTION_CASES_STATIC,
+    ids=[c[0] for c in PRODUCTION_CASES_STATIC],
+)
+def test_static_priority_production_traffic(
+    static_priority_nginx, label, accept_encoding, expected_ce,
+):
+    """Regression coverage for the top-10 Accept-Encoding shapes seen
+    in 24h of L1 webfront traffic (~20B requests). Asserts the static
+    handler chain picks the operator-preferred sidecar under each
+    real-world shape, falling through to the plain file when no static
+    module can serve the client.
+
+    expected_ce == None means "no Content-Encoding header" — sidecar
+    chain declined, plain file served.
+
+    Notable shapes covered:
+      * `br,gzip` with no OWS between tokens (3.7% of traffic).
+      * `gzip, x-gzip, deflate` — x-gzip ignored, falls through.
+      * gzip-only client (9.2%) — no .gz sidecar in our fixture so
+        falls through to plain; in a real deployment with gzip_static
+        + .gz sidecars this would be Content-Encoding: gzip.
+      * Empty AE header (6.9%) — no sidecar activates → plain.
+    """
+    r, body = http_request(
+        static_priority_nginx, "/both-static/sample",
+        accept_encoding=accept_encoding,
+    )
+    assert r.status_code == 200, f"[{label}] HTTP {r.status_code}"
+    actual_ce = r.headers.get("Content-Encoding")
+    if expected_ce is None:
+        assert actual_ce not in ("zstd", "br"), (
+            f"[{label}] AE={accept_encoding!r}: expected plain, got "
+            f"Content-Encoding={actual_ce!r}"
+        )
+        # In our build, "not zstd not br" actually means absent (no
+        # gzip_static module to set it). Double-check the body matches
+        # the plain file so a transparent passthrough of e.g. a stale
+        # cached encoded body would still fail.
+        assert body == PLAIN_FILE.read_bytes(), (
+            f"[{label}] AE={accept_encoding!r}: expected plain bytes, "
+            f"got {len(body)} bytes (plain is {PLAIN_FILE.stat().st_size})"
+        )
+    else:
+        assert actual_ce == expected_ce, (
+            f"[{label}] AE={accept_encoding!r}: expected "
+            f"Content-Encoding={expected_ce!r}, got {actual_ce!r}; "
+            f"all headers: {dict(r.headers)}"
+        )
+        expected_body = (
+            ZST_SIDECAR.read_bytes() if expected_ce == "zstd"
+            else BR_SIDECAR.read_bytes()
+        )
+        assert body == expected_body, (
+            f"[{label}] AE={accept_encoding!r}: served body mismatched "
+            f"sidecar — possible content-handler / load-module-order bug"
+        )

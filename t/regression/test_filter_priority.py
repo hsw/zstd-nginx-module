@@ -75,12 +75,17 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def brotli_nginx():
-    """Render config with brotli enabled inline. Loads brotli+zstd
-    modules dynamically on the dynamic-brotli image; no load_module
-    lines on the static-brotli image (modules linked into the binary)."""
+    """Render config with brotli + gzip enabled inline (zstd is on via the
+    template default). Loads brotli+zstd modules dynamically on the
+    dynamic-brotli image; no load_module lines on the static-brotli
+    image (modules linked into the binary). gzip is needed so the
+    production-traffic AE matrix can exercise gzip-only paths."""
     stop_nginx()
     render_template(
-        extra_directives="brotli on; brotli_min_length 0; brotli_types *;",
+        extra_directives=(
+            "brotli on; brotli_min_length 0; brotli_types *;"
+            " gzip on; gzip_min_length 0; gzip_types *;"
+        ),
         load_modules=_brotli_load_modules(),
     )
     start_nginx()
@@ -107,6 +112,80 @@ CASES = [
     ids=[c[0] for c in CASES],
 )
 def test_filter_priority(brotli_nginx, label, accept_encoding, expected_ce):
+    r, _ = http_request(
+        brotli_nginx, "/text", method="HEAD", accept_encoding=accept_encoding
+    )
+    ce = r.headers.get("Content-Encoding", "")
+    assert ce == expected_ce, (
+        f"[{label}] AE={accept_encoding!r}: "
+        f"expected Content-Encoding={expected_ce!r}, got {ce!r}; "
+        f"all headers: {dict(r.headers)}"
+    )
+
+
+# Top-10 real-world Accept-Encoding strings observed in L1 webfront traffic
+# over a 24h window (~20B requests). Numbers in the label column are the
+# request-share rank. The expected outcome column is the encoding the
+# filter chain (zstd > br > gzip) must pick — derived from the operator-
+# declared module priority, NOT from header order or q-values
+# (q-values only matter for the explicit-decline shape, covered above).
+#
+# Empty AE is sent as an empty header value; an absent header in
+# production has identical semantics for our filters (both decline
+# without a matching token). We forward this as Accept-Encoding: ""
+# rather than dropping the header to keep the test code uniform.
+PRODUCTION_CASES = [
+    # rank 1 — 30.9%: modern desktop browsers
+    ("prod-01-all-four",       "gzip, deflate, br, zstd",       "zstd"),
+    # rank 2 — 28.9%: pre-zstd shape; zstd absent, br wins over gzip
+    ("prod-02-br-gzip",        "br, gzip",                      "br"),
+    # rank 3 — 10.7%: same shape without zstd
+    ("prod-03-gzip-defl-br",   "gzip, deflate, br",             "br"),
+    # rank 4 — 9.2%: gzip-only client; gzip is the only supported option
+    ("prod-04-gzip-only",      "gzip",                          "gzip"),
+    # rank 5 — 6.9%: empty Accept-Encoding (or absent header); no
+    # compression — identity response
+    ("prod-05-empty",          "",                              ""),
+    # rank 6 — 5.7%: zstd absent, br wins over gzip
+    ("prod-06-gzip-br",        "gzip, br",                      "br"),
+    # rank 7 — 3.7%: br,gzip with no whitespace after comma — RFC 9110
+    # OWS tolerance asserted (parser must accept zero OWS bytes between
+    # token and OWS-only separator); zstd absent, br wins
+    ("prod-07-br-gzip-no-ows", "br,gzip",                       "br"),
+    # rank 8 — 1.0%: gzip with deflate (deflate not supported in nginx;
+    # only gzip remains as a server option)
+    ("prod-08-gzip-defl",      "gzip, deflate",                 "gzip"),
+    # rank 9 — 0.94%: x-gzip is the RFC 9110 synonym for gzip; nginx
+    # gzip filter accepts both. Test asserts the synonym is honored;
+    # outcome stays gzip
+    ("prod-09-gzip-xgzip",     "gzip, x-gzip, deflate",         "gzip"),
+    # rank 10 — 0.78%: sdch is deprecated and our parsers ignore it;
+    # zstd present → zstd wins
+    ("prod-10-all-plus-sdch",  "gzip, deflate, br, zstd, sdch", "zstd"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,accept_encoding,expected_ce",
+    PRODUCTION_CASES,
+    ids=[c[0] for c in PRODUCTION_CASES],
+)
+def test_filter_priority_production_traffic(
+    brotli_nginx, label, accept_encoding, expected_ce,
+):
+    """Regression coverage for the top-10 Accept-Encoding shapes seen in
+    24h of L1 webfront traffic (~20B requests). Asserts the filter chain
+    picks the operator-preferred encoding under each real-world shape.
+
+    Notable shapes:
+      * `br,gzip` with NO whitespace after the comma (3.7% of traffic) —
+        our RFC 9110 parser's OWS tolerance must accept zero-width OWS.
+      * `gzip, x-gzip, deflate` (0.94%) — x-gzip is the legacy synonym
+        for gzip per RFC 9110; nginx core gzip filter handles it.
+      * `gzip, deflate, br, zstd, sdch` (0.78%) — sdch is dead; our
+        parsers ignore unknown tokens and zstd wins.
+      * Empty AE header (6.9%) — no token matches → no compression.
+    """
     r, _ = http_request(
         brotli_nginx, "/text", method="HEAD", accept_encoding=accept_encoding
     )
