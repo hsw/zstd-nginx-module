@@ -255,6 +255,10 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
+    /* Enable Range / If-Range / 206 / Accept-Ranges for .zst sidecars.
+     * Matches nginx core gzip_static (src/http/modules/ngx_http_gzip_static_module.c). */
+    r->allow_ranges = 1;
+
     rc = ngx_http_send_header(r);
 
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
