@@ -170,18 +170,6 @@ def test_dict_direct_uses_configured_dict(dict_inherit_nginx):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "P2.1 (docs/codex3.md): dict inheritance silently drops "
-        "zstd_dict_file when the parent merged with enable=0 and the "
-        "child's level matches the inherited default. Filter merge at "
-        "filter/ngx_http_zstd_filter_module.c:1478-1481 assigns "
-        "conf->dict = prev->dict (= NULL). Fix is to load the dict "
-        "whenever prev->dict is NULL even on the level-match branch, "
-        "or to load eagerly at init_main_conf."
-    ),
-)
 def test_dict_inherited_through_off_parent(dict_inherit_nginx):
     """BUG reproduction: location uses the default comp_level (1) under
     a server that is `zstd off`. The merge path matches levels and
@@ -206,6 +194,40 @@ def test_dict_inherited_through_off_parent(dict_inherit_nginx):
     assert "zstd auto-window: skipped (dict configured)" in log, (
         "P2.1: child location did not inherit the configured dict. "
         "log tail:\n" + log[-2000:]
+    )
+
+
+def test_dict_inherited_through_on_off_on_chain(dict_inherit_nginx):
+    """Inverse-shape sanity: http `zstd on` + dict_file, server
+    `zstd off`, location `zstd on` (same default level=1). After the
+    P2.1 fix the child reload-from-file branch fires (prev->dict is
+    NULL because parent merged with enable=0), so the configured dict
+    is loaded and the body filter emits the dict-skipped marker.
+
+    Also verifies the fix doesn't double-load: each compressed request
+    must emit the dict-skipped marker exactly once (one body-filter
+    pass → one log line), proving we use a single CDict per
+    request, not one per merge-level encountered on the conf chain.
+    """
+    # Truncate the log so we count markers from this request only.
+    if LOG_PATH.exists():
+        LOG_PATH.write_text("")
+
+    r, body = http_request(
+        dict_inherit_nginx, "/dict-inherit/page.html",
+        accept_encoding="zstd",
+    )
+    assert r.status_code == 200, f"status={r.status_code}"
+    assert r.headers.get("Content-Encoding") == "zstd", (
+        f"got Content-Encoding={r.headers.get('Content-Encoding')!r}"
+    )
+    log = _read_log()
+    marker = "zstd auto-window: skipped (dict configured)"
+    count = log.count(marker)
+    assert count == 1, (
+        f"P2.1 inverse-shape: expected exactly one dict-skipped "
+        f"marker per request, got {count}. log tail:\n"
+        + log[-2000:]
     )
 
 

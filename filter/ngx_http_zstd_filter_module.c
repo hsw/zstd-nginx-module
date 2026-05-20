@@ -1465,10 +1465,17 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
      * No ngx_conf_merge_ptr_value(conf->dict, ...) here: conf->dict
      * is initialised to NULL by ngx_pcalloc (not NGX_CONF_UNSET_PTR),
      * so the macro would never copy from the parent. The real
-     * dict-merge runs below as the alternative to the dict-file load
-     * path (level matches → reuse parent CDict via assignment
-     * `conf->dict = prev->dict`; level differs → load a fresh dict
-     * from file). The two branches are mutually exclusive.
+     * dict-merge runs below as three mutually exclusive paths:
+     *   1. parent loaded a dict AND level matches → reuse parent CDict
+     *      via assignment `conf->dict = prev->dict`;
+     *   2. parent loaded a dict but level differs → load a fresh dict
+     *      from file (separate CDict pinned to this level);
+     *   3. parent->dict == NULL (parent block was `zstd off` and never
+     *      loaded the dict, even though zstd_dict_file is configured
+     *      at main-conf) → load a fresh dict from file regardless of
+     *      level match. Without this third path the configured dict
+     *      is silently dropped on the http→server(off)→location(on)
+     *      shape (codex3 P2.1).
      */
     ngx_conf_merge_bufs_value(conf->bufs, prev->bufs,
                               (128 * 1024) / ngx_pagesize, ngx_pagesize);
@@ -1477,13 +1484,15 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     if (conf->enable && zmcf->dict_file.len > 0) {
 
-        if (conf->level == prev->level) {
+        if (conf->level == prev->level && prev->dict != NULL) {
             conf->dict = prev->dict;
 
         } else {
             /*
-             * compression level is different from the outer block,
-             * so we should create a seperate dict object.
+             * Either compression level differs from the outer block, or
+             * the outer block never loaded the dict (prev->dict == NULL
+             * because parent was `zstd off`). In both cases we load a
+             * fresh CDict from the configured file.
              */
 
             fd = ngx_open_file(zmcf->dict_file.data, NGX_FILE_RDONLY,
