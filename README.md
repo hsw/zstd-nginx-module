@@ -190,6 +190,8 @@ Enables ("on") or disables ("off") checking the existence of precompressed files
 
 With the _"always"_ value, "zstd" file is used in all cases, without checking if the client supports it.
 
+Range requests on `.zst` sidecars are supported: when `zstd_static` serves a `.zst` file the handler sets `r->allow_ranges = 1` before sending headers, so nginx core's range filter delivers 206 Partial Content / 416 / `Accept-Ranges: bytes` / `If-Range` exactly as it would for an uncompressed static file. Matches `gzip_static` behaviour.
+
 
 # Variables
 

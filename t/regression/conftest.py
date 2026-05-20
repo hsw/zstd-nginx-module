@@ -203,6 +203,7 @@ def http_request(
     accept_encoding: str | None = None,
     timeout: float = 5.0,
     data: bytes | str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> tuple[requests.Response, bytes]:
     """HTTP request helper that defeats two pieces of urllib3 magic that
     interfere with content-negotiation tests:
@@ -217,10 +218,15 @@ def http_request(
 
     Returns (response, raw_bytes). Response's headers/status are reliable;
     response.content is NOT — use the second tuple element instead.
+
+    Extra request headers may be passed via `headers=`; `Accept-Encoding`
+    from that dict takes precedence over the `accept_encoding=` kwarg.
     """
-    headers = {"Accept-Encoding": accept_encoding if accept_encoding is not None else "identity"}
+    hdrs = {"Accept-Encoding": accept_encoding if accept_encoding is not None else "identity"}
+    if headers:
+        hdrs.update(headers)
     r = requests.request(
-        method, url + path, headers=headers, timeout=timeout,
+        method, url + path, headers=hdrs, timeout=timeout,
         stream=True, data=data,
     )
     body = r.raw.read(decode_content=False) if method != "HEAD" else b""

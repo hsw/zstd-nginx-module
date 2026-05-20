@@ -9,6 +9,11 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Added
 
+- `ngx_http_zstd_static_module` now enables Range requests on `.zst`
+  sidecars (sets `r->allow_ranges = 1` before `ngx_http_send_header`),
+  matching nginx core `gzip_static`. Clients can now request byte ranges
+  of precompressed `.zst` files (206 Partial Content / 416 / If-Range /
+  Accept-Ranges: bytes).
 - New `zstd_window_bits N;` directive (http / server / location). Sets an
   upper cap on the per-request `windowLog`. Range validated at config-parse
   time against the runtime `ZSTD_cParam_getBounds(ZSTD_c_windowLog)` (typically
@@ -42,6 +47,16 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Fixed
 
+- `ngx_http_zstd_filter_module` recycled output buffer no longer carries
+  stale `b->flush` / `b->sync` / `b->last_buf` / `b->last_in_chain` from
+  a prior use. After `ngx_chain_update_chains` returned the link to
+  `ctx->free`, a subsequent reuse via `_get_buf` could promote a normal
+  data emission into a spurious downstream flush (latency artefact) or a
+  false end-of-stream marker.
+- `ngx_http_zstd_static_module` now sets `b->sync` for the output buffer
+  to match nginx core `gzip_static` (`b->sync = (b->last_buf || b->in_file) ? 0 : 1;`).
+  Avoids edge cases on zero-byte `.zst` sidecars where neither `last_buf`
+  nor `in_file` is set on the trailing buf.
 - `$zstd_ratio` variable truncated on responses larger than ~4.29 MB. The
   ratio computation used 32-bit arithmetic, so `in_bytes * 1000` overflowed
   whenever `in_bytes > UINT32_MAX / 1000`, producing nonsense ratios for
@@ -59,6 +74,13 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   expects `NGX_CONF_OK` (which is `(char *) NULL`). No behavior change,
   but the typed return is correct per the nginx module contract and
   matches every other config callback in the module.
+
+### Build
+
+- Fix stray space in the `-Wl,-rpath, $ZSTD_LIB` linker flag emitted by
+  `filter/config` and `static/config`. GNU ld tolerated the form as two
+  separate flag words; BFD/lld and some cross-toolchains treat the
+  comma-terminated form as canonical and rejected the space variant.
 
 ## [0.3.0] - 2026-05-18
 

@@ -1,36 +1,13 @@
-"""Recycled output buffer must not carry stale control flags (codex2 #7).
+"""Recycled output buffer path coverage (codex2 #7).
 
-Background: `ngx_http_zstd_filter_get_buf` recycles output bufs via
-`ctx->free` once `ngx_chain_update_chains` returns them to the pool.
-Before commit `<this-fix>`, the recycled buf retained the `b->flush=1`
-that was set on the previous emission at line 642 of
-`filter/ngx_http_zstd_filter_module.c`. A second data write reusing
-the same buf would carry a spurious downstream flush — a latency
-artefact (extra `b->flush` events trigger early
-`ngx_http_writer`/`ngx_http_output_filter` walks of the chain).
-
-The bug is hard to observe directly from a black-box HTTP client —
-`b->flush` is an in-process flag on `ngx_buf_t`, not a wire-level
-signal. The pragmatic test below is **behavioural coverage**: it
-configures `zstd_buffers 2 4k` to force aggressive buf recycling,
-drives an upstream that flushes between data segments (proxy_buffering
-off + chunked transfer with inter-chunk gaps), and asserts:
-
-    1. nginx does NOT crash / hang under the recycling pressure
-    2. the decompressed body round-trips byte-identically against the
-       upstream ground truth
-    3. response carries `Content-Encoding: zstd` (filter actually ran)
-
-The contrived scenario exercises the `ctx->free` branch in
-`_get_buf` repeatedly. Combined with `t/asan.sh` / `t/valgrind.sh`
-this also catches any latent stale-pointer / use-after-free in the
-recycled-buf path. The strict invariant (recycled buf has no stale
-`flush=1`) is verified by code-review of the source change; this
-test is the harness-side regression guard.
-
-If the source fix is reverted, this test still passes (it only
-exercises the path) — that is intentional. The behavioural value is
-that ASan/UBSan / valgrind variants now have a routine workload
+Behavioural-coverage test for the `ctx->free` reuse branch in
+`ngx_http_zstd_filter_get_buf`. Configures `zstd_buffers 2 4k` and
+drives a chunked upstream with inter-chunk flushes so the filter
+cycles its two output bufs through `ctx->free` many times. Asserts
+no crash / hang and byte-identical round-trip. The strict invariant
+(recycled buf has no stale `flush=1` / `sync` / `last_buf` /
+`last_in_chain`) is verified by code review of the source change;
+this test gives ASan/UBSan/valgrind variants a routine workload
 running through the recycled-buf branch.
 """
 
@@ -151,16 +128,9 @@ def nginx_with_recycle_location(upstream_fixture) -> Iterator[str]:
         stop_nginx()
 
 
-def test_recycled_buf_roundtrip(nginx_with_recycle_location, tmp_path):
+def test_recycled_buf_path_coverage_no_crash(nginx_with_recycle_location, tmp_path):
     """Aggressive recycling under flush pressure must not crash, hang,
-    or corrupt the response.
-
-    Behavioural-coverage test (NOT a strict invariant assertion) — the
-    invariant that recycled bufs have flush=0/sync=0/last_buf=0/
-    last_in_chain=0 cleared is verified by code review; this harness
-    exercises the path so ASan/valgrind variants catch any latent
-    stale-pointer regressions.
-    """
+    or corrupt the response."""
     url = nginx_with_recycle_location + "/recycle/"
     start = time.monotonic()
     r = requests.get(

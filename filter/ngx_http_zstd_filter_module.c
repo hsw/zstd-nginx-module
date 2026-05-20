@@ -746,16 +746,6 @@ ngx_http_zstd_filter_get_buf(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         ctx->out_buf = cl->buf;
         ngx_free_chain(r->pool, cl);
 
-        /*
-         * Recycled buffer may carry stale control flags from prior use —
-         * `b->flush = 1` is set at line 642 on the previous output-chain
-         * link when a flush op drains, and after ngx_chain_update_chains
-         * moves the link back onto ctx->free the flag persists. Reusing
-         * the buf without resetting promotes a normal data emission into
-         * a spurious downstream flush (latency artefact) or, if `last_buf`
-         * was set, a false end-of-stream marker. Match nginx core
-         * gzip filter's clear-on-reuse discipline.
-         */
         ctx->out_buf->flush = 0;
         ctx->out_buf->sync = 0;
         ctx->out_buf->last_buf = 0;
