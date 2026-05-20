@@ -28,6 +28,7 @@ import requests
 from conftest import (
     BASE_URL,
     _nginx_has_compat,
+    http_request,
     render_template,
     start_nginx,
     stop_nginx,
@@ -119,6 +120,6 @@ def test_still_serving_after_reload_storm(reload_nginx):
     """Sanity: the cleanup path runs at pool-destroy. A buggy implementation
     that double-frees would have crashed the master long before this point —
     so a successful baseline GET confirms the master is healthy."""
-    r = requests.get(reload_nginx + "/", timeout=2)
+    r, body = http_request(reload_nginx, "/", timeout=2)
     assert r.status_code == 200
-    assert r.text.strip() == "ok"
+    assert body.strip() == b"ok"

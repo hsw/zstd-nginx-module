@@ -108,7 +108,8 @@ def _wait_for_listen(timeout_s: float = 6.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            requests.get(BASE_URL + "/", timeout=1).raise_for_status()
+            r, _ = http_request(BASE_URL, "/", timeout=1)
+            r.raise_for_status()
             return
         except Exception:
             time.sleep(0.1)
