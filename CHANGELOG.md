@@ -40,6 +40,26 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   workspace. Defends against future libzstd heuristic regressions that
   could return larger cParams for the same level + srcSize.
 
+### Fixed
+
+- `$zstd_ratio` variable truncated on responses larger than ~4.29 MB. The
+  ratio computation used 32-bit arithmetic, so `in_bytes * 1000` overflowed
+  whenever `in_bytes > UINT32_MAX / 1000`, producing nonsense ratios for
+  the very responses where ratio reporting matters most. Multiplication
+  now widens to `uint64_t` before division.
+- `$zstd_ratio` output buffer width on 64-bit. The variable scratch was
+  sized for a 32-bit decimal; on a 64-bit platform a pathologically large
+  numerator could exceed the buffer. Widened to `NGX_INT_T_LEN`.
+- `zstd_min_length` directive accepted multi-argument configurations
+  silently (the directive's `args` mask permitted variadic forms). The
+  directive is now declared `NGX_CONF_TAKE1`, so `zstd_min_length 256 512;`
+  is rejected at config-parse time as a typo / misuse rather than being
+  parsed loosely.
+- `merge_loc_conf` returned a bare `NULL` literal where the nginx ABI
+  expects `NGX_CONF_OK` (which is `(char *) NULL`). No behavior change,
+  but the typed return is correct per the nginx module contract and
+  matches every other config callback in the module.
+
 ## [0.3.0] - 2026-05-18
 
 ### Changed

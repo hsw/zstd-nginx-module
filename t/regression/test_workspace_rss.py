@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import socket
 import threading
 import time
@@ -452,16 +453,22 @@ _AW_RSS_BODY_SIZE = 4096  # 4 KiB compressible body per plan
 
 
 def _aw_rss_body() -> bytes:
-    """Compressible 4 KiB pattern. Auto-window picks windowLog from
-    ceil(log2(4096)) = 12 -> workspace ~80 KiB. Compressed bytes ~few
-    hundred, so the slow drain has to space out the read to actually
-    hold the response open for the duration of the test."""
-    pattern = (
-        b"The quick brown fox jumps over the lazy dog. "
-        b"Sphinx of black quartz, judge my vow.\n"
-    )
-    reps = (_AW_RSS_BODY_SIZE + len(pattern) - 1) // len(pattern)
-    return (pattern * reps)[:_AW_RSS_BODY_SIZE]
+    """Incompressible 4 KiB random body. Auto-window picks windowLog from
+    ceil(log2(4096)) = 12 -> workspace ~80 KiB. By using random bytes the
+    compressed payload stays ~4 KiB (vs ~177 B for a repeating pattern),
+    so the slow-drain loop in httpx.aiter_raw(chunk_size=1024) actually
+    iterates multiple times with asyncio.sleep between chunks — pinning
+    the workspace for the full test window and making concurrency real
+    rather than illusory. Discriminativeness for the auto-window regression
+    is still asserted via the `ws=<N>` log parse below; the incompressible
+    body lifts the OOM-guard framing from misleading to actually exercised.
+
+    Determinism: random seed fixed at module import so wire bytes are
+    reproducible across runs (relevant if a future assertion grows to
+    check exact lengths)."""
+    import random
+    rng = random.Random(0xA5E55)
+    return rng.randbytes(_AW_RSS_BODY_SIZE)
 
 
 def _aw_rss_handle(c: socket.socket) -> None:
@@ -547,10 +554,16 @@ def test_workspace_rss_shrinks_under_known_content_length():
     )
     server_thread.start()
 
+    # error_log info captures the per-request auto-window line so we can
+    # actually discriminate the regression direction: the test below
+    # parses `ws=<N>` and asserts it shrunk below the level-default
+    # baseline. Without this, a regression that reverted auto-tune would
+    # only be caught when the test is run under a docker --memory cap —
+    # bare `bash t/run.sh` would silently pass.
     stop_nginx()
     render_template(
         extra_directives=(
-            f"error_log {log_path} warn;\n"
+            f"error_log {log_path} info;\n"
             "zstd_comp_level 6;"
         ),
         extra_locations=(
@@ -623,16 +636,20 @@ def test_workspace_rss_shrinks_under_known_content_length():
     )
 
     sizes = sorted(results)
-    # Compressed 4 KiB of the repeating pattern should be very small
-    # (typically <300 B). Floor at 10 B guards against degenerate
-    # responses; ceiling at the input size guards against an
-    # uncompressed pass-through being silently treated as zstd.
+    # Compressed 4 KiB of random (incompressible) bytes lands at roughly
+    # the same size as the input plus a small zstd frame overhead. Floor
+    # at 10 B guards against degenerate (truncated/empty) responses;
+    # ceiling at input + 64 B headroom guards against an uncompressed
+    # pass-through being silently treated as zstd while still allowing
+    # legitimate frame-header bytes.
     assert sizes[0] >= 10, (
         f"smallest response only {sizes[0]} bytes -- response shape "
         f"is wrong (truncation? upstream error?)"
     )
-    assert sizes[-1] <= _AW_RSS_BODY_SIZE, (
-        f"largest response {sizes[-1]} bytes > input {_AW_RSS_BODY_SIZE}"
+    # +64 B accommodates zstd frame header/footer overhead on
+    # incompressible inputs (compressed size ~= input size).
+    assert sizes[-1] <= _AW_RSS_BODY_SIZE + 64, (
+        f"largest response {sizes[-1]} bytes > input {_AW_RSS_BODY_SIZE}+64"
         f" -- compression failed open or auto-window broke ratio"
     )
 
@@ -649,6 +666,32 @@ def test_workspace_rss_shrinks_under_known_content_length():
         f"libzstd's actual workspace demand for srcSize="
         f"{_AW_RSS_BODY_SIZE}. Fallback path fired. Log content:\n"
         f"{log_content}"
+    )
+
+    # Discriminator for the auto-window regression direction: parse the
+    # per-request `ws=<N>` and assert it shrunk well below the level=6
+    # default baseline (~5.5 MB ≈ 5,500,000 bytes). For a 4 KiB body the
+    # auto-tune picks windowLog=12 → ws ~80-100 KiB, comfortably below
+    # 500 KiB. Bare `bash t/run.sh` (no docker --memory cap) would
+    # otherwise silently pass a regression that reverted auto-tune since
+    # the host has GiB of RAM to spare.
+    aw_re = re.compile(
+        r"zstd auto-window: cl=\d+ wlog=\d+ hlog=\d+ clog=\d+ "
+        r"ws=(\d+) baseline=\d+"
+    )
+    ws_values = [int(m.group(1)) for m in aw_re.finditer(log_content)]
+    assert ws_values, (
+        f"no auto-window log lines captured; either nginx never ran "
+        f"compression or the log file path differs.\nLog tail:\n"
+        f"{log_content[-2000:]}"
+    )
+    max_ws = max(ws_values)
+    # 500 KiB ceiling: tolerant of headroom additions but well below the
+    # ~5.5 MB level-default that would indicate a regression.
+    assert max_ws < 500 * 1024, (
+        f"auto-window ws too large for 4 KiB body: max(ws)={max_ws} "
+        f"bytes, expected <500 KiB. Regression: auto-tune may have been "
+        f"reverted to the level-default workspace path."
     )
 
     print(
