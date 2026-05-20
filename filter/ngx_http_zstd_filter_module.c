@@ -43,6 +43,19 @@ typedef struct {
     ngx_int_t                    level;
     ssize_t                      min_length;
 
+    /*
+     * Auto-Window: per-request workspace shrink based on response
+     * Content-Length. window_bits is an OPTIONAL operator-supplied
+     * upper cap on libzstd's auto-derived windowLog (NGX_CONF_UNSET
+     * means no cap). baseline_ws caches the level-default workspace
+     * estimate computed at merge time — used both as the fallback
+     * workspace size when auto-tune cannot run and as the
+     * forward-compat ceiling that prevents future libzstd versions
+     * from accidentally growing per-request memory.
+     */
+    ngx_int_t                    window_bits;
+    size_t                       baseline_ws;
+
     ngx_hash_t                   types;
 
     ngx_bufs_t                   bufs;
@@ -113,12 +126,27 @@ typedef struct {
     unsigned                     flush:1;
     unsigned                     done:1;
     unsigned                     nomem:1;
+
+    /*
+     * Auto-Window: snapshot of r->headers_out.content_length_n captured
+     * in the header_filter BEFORE ngx_http_clear_content_length() zeroes
+     * it (compression makes the on-wire length unknown). The body
+     * filter's create_cstream reads this to derive cParams via
+     * ZSTD_getCParams(level, content_length, 0). -1 means "unknown"
+     * (chunked / upstream didn't set it).
+     */
+    off_t                        content_length_n;
 } ngx_http_zstd_ctx_t;
 
 
 typedef struct {
     ngx_conf_post_handler_pt  post_handler;
 } ngx_http_zstd_comp_level_bounds_t;
+
+
+typedef struct {
+    ngx_conf_post_handler_pt  post_handler;
+} ngx_http_zstd_window_bits_bounds_t;
 
 
 static ngx_http_output_header_filter_pt  ngx_http_next_header_filter;
@@ -154,6 +182,7 @@ static void ngx_http_zstd_filter_free(void *opaque, void *address);
 static ngx_int_t ngx_http_zstd_filter_release_workspace(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx, ZSTD_CStream *cstream, ngx_uint_t err_level);
 static char *ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data);
+static char *ngx_http_zstd_window_bits(ngx_conf_t *cf, void *post, void *data);
 static char *ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void ngx_http_zstd_cdict_cleanup(void *data);
 static void ngx_http_zstd_filter_cleanup(void *data);
@@ -161,6 +190,11 @@ static void ngx_http_zstd_filter_cleanup(void *data);
 
 static ngx_http_zstd_comp_level_bounds_t  ngx_http_zstd_comp_level_bounds = {
     ngx_http_zstd_comp_level
+};
+
+
+static ngx_http_zstd_window_bits_bounds_t  ngx_http_zstd_window_bits_bounds = {
+    ngx_http_zstd_window_bits
 };
 
 
@@ -208,6 +242,13 @@ static ngx_command_t  ngx_http_zstd_filter_commands[] = {
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_zstd_main_conf_t, dict_file),
       NULL },
+
+    { ngx_string("zstd_window_bits"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_zstd_loc_conf_t, window_bits),
+      &ngx_http_zstd_window_bits_bounds },
 
     ngx_null_command
 };
@@ -282,6 +323,17 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 
     ctx->request = r;
     ctx->last_out = &ctx->out;
+
+    /*
+     * Snapshot the upstream-declared Content-Length BEFORE we call
+     * ngx_http_clear_content_length() below (compression makes the
+     * on-wire length unknown). The body filter's create_cstream uses
+     * this to derive auto-window cParams via ZSTD_getCParams(level,
+     * content_length, 0). Chunked / unknown-size responses leave the
+     * field at -1 here so the body filter's auto-tune skip path
+     * triggers correctly.
+     */
+    ctx->content_length_n = r->headers_out.content_length_n;
 
     h = ngx_list_push(&r->headers_out.headers);
     if (h == NULL) {
@@ -717,36 +769,116 @@ static ZSTD_CStream *
 ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
     ngx_http_zstd_ctx_t *ctx)
 {
-    size_t                      rc, ws_size;
+    size_t                      rc, ws_size, est;
     ZSTD_CStream               *cstream;
     ZSTD_customMem              cmem;
     ngx_pool_cleanup_t         *cln;
     ngx_http_zstd_loc_conf_t   *zlcf;
+    ZSTD_compressionParameters  cparams;
+    ngx_int_t                   apply_auto;
+    unsigned long long          srcSize;
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
     /*
-     * Direction A: preallocate one chunk sized to libzstd's worst-case
-     * workspace estimate for the configured level, plus
-     * NGX_HTTP_ZSTD_WORKSPACE_HEADROOM bytes for per-sub-allocation
-     * alignment overhead (see macro definition near top of file). The
-     * customAlloc shim bumps forward into this chunk; on done/abort the
-     * chunk is freed in one shot, returning mmap'd pages immediately to
-     * the kernel.
+     * Auto-Window: shrink the per-request workspace when the response
+     * Content-Length is known OR an operator cap is configured. The
+     * derived cParams are applied to the CCtx via ZSTD_CCtx_setParameter
+     * AFTER reset + refCDict / compressionLevel (see below). The
+     * forward-compat guard refuses any cParams whose estimated workspace
+     * exceeds zlcf->baseline_ws (the level-default cached at merge
+     * time) — defends against future libzstd heuristic regressions that
+     * could grow per-request memory.
      *
-     * ZSTD_estimateCStreamSize is documented as the worst-case static-
-     * arena size for ZSTD_initStaticCStream, where libzstd packs without
-     * padding. The estimate can return an error on unusual configs
-     * (e.g. extreme levels with non-default advanced params); guard
-     * with ZSTD_isError.
+     * Activates when EITHER:
+     *   (a) r->headers_out.content_length_n > 0 — body size known, use
+     *       it as the srcSize hint;
+     *   (b) zlcf->window_bits != NGX_CONF_UNSET — operator wants the
+     *       cap to apply regardless of transfer encoding (e.g.
+     *       Chrome-compat windowLog<=23 for chunked responses too).
+     *       srcSize hint is ZSTD_CONTENTSIZE_UNKNOWN so libzstd uses
+     *       level defaults that we then clamp.
+     *
+     * Otherwise (chunked / unknown C-L without operator cap): skip the
+     * auto-tune path entirely. ws_size stays at the level-default
+     * baseline and no setParameter calls are issued — status quo for
+     * chunked responses.
      */
-    ws_size = ZSTD_estimateCStreamSize((int) zlcf->level);
-    if (ZSTD_isError(ws_size)) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                      "ZSTD_estimateCStreamSize() failed: %s",
-                      ZSTD_getErrorName(ws_size));
-        return NULL;
+    ws_size = zlcf->baseline_ws;
+    apply_auto = 0;
+
+    if (ctx->content_length_n > 0
+        || zlcf->window_bits != NGX_CONF_UNSET)
+    {
+        if (ctx->content_length_n > 0) {
+            srcSize = (unsigned long long) ctx->content_length_n;
+        } else {
+            srcSize = ZSTD_CONTENTSIZE_UNKNOWN;
+        }
+
+        cparams = ZSTD_getCParams((int) zlcf->level, srcSize, 0);
+
+        if (zlcf->window_bits != NGX_CONF_UNSET
+            && (ngx_int_t) cparams.windowLog > zlcf->window_bits)
+        {
+            cparams.windowLog = (unsigned) zlcf->window_bits;
+            /*
+             * Do NOT manually re-derive hashLog/chainLog: libzstd's
+             * setParameter / reset path applies its own dependent-param
+             * clamp (see ZSTD_adjustCParams_internal in
+             * tmp/src/zstd/lib/compress/zstd_compress.c lines 1568-1583).
+             * Re-deriving here would drift between libzstd versions.
+             */
+        }
+
+        est = ZSTD_estimateCStreamSize_usingCParams(cparams);
+        if (!ZSTD_isError(est) && est <= zlcf->baseline_ws) {
+            ws_size = est;
+            apply_auto = 1;
+
+            /*
+             * Emit at NGX_LOG_INFO so the regression matrix (which
+             * runs the non-debug nginx-mainline build from nginx.org)
+             * can observe the chosen cParams via a configurable
+             * error_log file. Tests grep this exact prefix; do not
+             * change without updating t/regression/test_auto_window.py.
+             * Production deployments that don't want per-request info
+             * lines can raise error_log to `notice` or above.
+             */
+            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                          "zstd auto-window: cl=%O wlog=%ud hlog=%ud "
+                          "clog=%ud ws=%uz baseline=%uz",
+                          (ctx->content_length_n > 0)
+                              ? ctx->content_length_n
+                              : (off_t) -1,
+                          cparams.windowLog, cparams.hashLog,
+                          cparams.chainLog, est, zlcf->baseline_ws);
+        }
+        /*
+         * Forward-compat fallback: triggered when
+         * est > zlcf->baseline_ws (auto-tune would GROW the workspace
+         * vs the level baseline cached at merge time). With the
+         * libzstd versions pinned by our matrix this branch is
+         * unreachable — ZSTD_adjustCParams_internal only downsizes
+         * cParams relative to level defaults. The branch defends
+         * against a hypothetical future libzstd heuristic regression
+         * that returns LARGER cParams for the same level+srcSize. On
+         * fallback ws_size remains at baseline_ws and apply_auto stays
+         * 0, so the CStream initialises with level defaults — identical
+         * to pre-auto-tune behaviour. ZSTD_isError(est) covers the
+         * unrelated case where the estimator itself errors on the
+         * derived cParams; same fallback applies.
+         *
+         * No runtime test for this branch; see plan §"Forward-compat
+         * fallback (code-review only)" for rationale.
+         */
+    } else {
+        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+                      "zstd auto-window: skipped (no content_length_n, "
+                      "no cap), ws=baseline=%uz",
+                      zlcf->baseline_ws);
     }
+
     ws_size += NGX_HTTP_ZSTD_WORKSPACE_HEADROOM;
 
     ctx->preallocated = ngx_palloc(r->pool, ws_size);
@@ -828,6 +960,44 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
                           "failed: %s",
                           ZSTD_getErrorName(rc));
 
+            goto failed;
+        }
+    }
+
+    /*
+     * Auto-Window: apply the auto-derived cParams. Order: windowLog
+     * first (others depend on it), then hashLog, then chainLog.
+     * libzstd's per-param validation accepts intermediate states
+     * because cParams clamping happens en-masse at
+     * ZSTD_resetCCtx_internal time (called lazily on the first
+     * compressStream2), not at each setParameter call. The customAlloc
+     * workspace allocation happens lazily at reset time too, AFTER
+     * these setParameter calls — so the cParams set here drive the
+     * actual workspace demand, matching our ws_size estimate.
+     */
+    if (apply_auto) {
+        rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_windowLog,
+                                    (int) cparams.windowLog);
+        if (ZSTD_isError(rc)) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "ZSTD_CCtx_setParameter(windowLog=%ud) failed: %s",
+                          cparams.windowLog, ZSTD_getErrorName(rc));
+            goto failed;
+        }
+        rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_hashLog,
+                                    (int) cparams.hashLog);
+        if (ZSTD_isError(rc)) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "ZSTD_CCtx_setParameter(hashLog=%ud) failed: %s",
+                          cparams.hashLog, ZSTD_getErrorName(rc));
+            goto failed;
+        }
+        rc = ZSTD_CCtx_setParameter(cstream, ZSTD_c_chainLog,
+                                    (int) cparams.chainLog);
+        if (ZSTD_isError(rc)) {
+            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
+                          "ZSTD_CCtx_setParameter(chainLog=%ud) failed: %s",
+                          cparams.chainLog, ZSTD_getErrorName(rc));
             goto failed;
         }
     }
@@ -1145,11 +1315,13 @@ ngx_http_zstd_create_loc_conf(ngx_conf_t *cf)
      *    conf->types = { NULL };
      *    conf->types_keys = NULL;
      *    conf->dict = NULL;
+     *    conf->baseline_ws = 0;
      */
 
     conf->enable = NGX_CONF_UNSET;
     conf->level = NGX_CONF_UNSET;
     conf->min_length = NGX_CONF_UNSET;
+    conf->window_bits = NGX_CONF_UNSET;
 
     return conf;
 }
@@ -1177,6 +1349,39 @@ ngx_http_zstd_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_value(conf->level, prev->level, 1);
     ngx_conf_merge_value(conf->min_length, prev->min_length, 20);
+    ngx_conf_merge_value(conf->window_bits, prev->window_bits, NGX_CONF_UNSET);
+
+    /*
+     * Cache the level-default workspace estimate. Used by the
+     * Auto-Window path (Task 2) as both the fallback workspace size
+     * (when content_length_n is unknown and no operator cap is set)
+     * AND the forward-compat ceiling that refuses any auto-derived
+     * cParams whose estimated workspace exceeds the level-default
+     * baseline. Computed once at config time so the per-request hot
+     * path never re-estimates. On ZSTD_isError we fall back to the
+     * level=1 baseline and warn — should be unreachable with a
+     * sane level already validated by ngx_http_zstd_comp_level().
+     */
+    {
+        size_t  est;
+
+        est = ZSTD_estimateCStreamSize((int) conf->level);
+        if (ZSTD_isError(est)) {
+            ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                               "ZSTD_estimateCStreamSize(%i) failed: %s, "
+                               "falling back to level=1 baseline",
+                               conf->level, ZSTD_getErrorName(est));
+            est = ZSTD_estimateCStreamSize(1);
+            if (ZSTD_isError(est)) {
+                /* Extremely unlikely; refuse rather than store 0. */
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "ZSTD_estimateCStreamSize(1) failed: %s",
+                                   ZSTD_getErrorName(est));
+                return NGX_CONF_ERROR;
+            }
+        }
+        conf->baseline_ws = est;
+    }
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
                              &prev->types_keys, &prev->types,
@@ -1505,6 +1710,44 @@ ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data)
 
     return NGX_CONF_OK;
 }
+
+
+static char *
+ngx_http_zstd_window_bits(ngx_conf_t *cf, void *post, void *data)
+{
+    ngx_int_t   *np = data;
+    ngx_int_t    lower, upper;
+    ZSTD_bounds  bounds;
+
+    /*
+     * Query the runtime libzstd for the supported windowLog range.
+     * Using ZSTD_cParam_getBounds (stable API since 1.4.0) instead of
+     * the compile-time ZSTD_WINDOWLOG_{MIN,MAX} macros so dynamic-link
+     * builds report the bounds of the actually-loaded library, and so
+     * the 32-bit vs 64-bit upper-bound difference is reported faithfully
+     * without our own sizeof(size_t) branch. On the unlikely event that
+     * the runtime query fails we fall back to the compile-time macros
+     * (defensive; unreachable with stable libzstd).
+     */
+    bounds = ZSTD_cParam_getBounds(ZSTD_c_windowLog);
+    if (ZSTD_isError(bounds.error)) {
+        lower = ZSTD_WINDOWLOG_MIN;
+        upper = ZSTD_WINDOWLOG_MAX;
+    } else {
+        lower = bounds.lowerBound;
+        upper = bounds.upperBound;
+    }
+
+    if (*np < lower || *np > upper) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "zstd_window_bits must be between %i and %i",
+                           lower, upper);
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
 
 static char *
 ngx_conf_zstd_set_num_slot_with_negatives(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)

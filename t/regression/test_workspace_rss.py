@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import threading
 import time
 from pathlib import Path
 
@@ -399,6 +400,262 @@ def test_concurrent_workspace_pinning_oom_guard(workspace_nginx):
         f"\n[concurrent] {concurrency} slow-drain requests in "
         f"{elapsed_s:.1f}s, drain rate {drain_rate_kib_s} KiB/s, "
         f"response sizes {sizes[0]}..{sizes[-1]} bytes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Auto-Window RSS reduction OOM-guard (sibling of the slow-drain pinning
+# guard above). Verifies that with a KNOWN Content-Length on the upstream
+# response, the auto-window code path (commit 4ddc5c9) shrinks each
+# request's CStream workspace from the level-default (~5.5 MB at level=6)
+# to the body-sized estimate (~80 KiB for a 4 KiB body, windowLog~=12).
+#
+# What this test guards against:
+#   - regression of the per-request auto-tune in
+#     ngx_http_zstd_filter_create_cstream: if a future change reverts the
+#     ZSTD_getCParams + ZSTD_estimateCStreamSize_usingCParams path back to
+#     ZSTD_estimateCStreamSize(level), each in-flight slow-drain request
+#     would once again pin ~5.5 MB of workspace. At 200 concurrent
+#     in-flight clients that is ~1.1 GB of peak workspace -- the same
+#     pre-Direction-A pinning shape, just triggered by known-C-L workloads
+#     instead of chunked ones
+#   - regression of the bump-allocator-fit invariant (auto-tuned ws_size
+#     must cover libzstd's actual customAlloc demand); a miss would emit
+#     "zstd workspace exhausted" at NGX_LOG_ALERT, which we grep below
+#
+# The auto-window log line itself is emitted at NGX_LOG_INFO (see plan
+# Task 2 deviation), not WARN. We keep the error_log at warn level
+# because (a) the ALERT-level workspace-exhausted line still surfaces,
+# and (b) the test asserts memory/correctness, not log-line presence.
+#
+# Discriminativeness note: like the sibling OOM-guard above, container
+# OOM detection only triggers when this test is launched with a docker
+# `--memory=NNNm` cap below ~1.1 GB. Inside the default run.sh (no
+# memory cap) the test verifies correctness only. To stress the memory
+# ceiling explicitly:
+#
+#     docker run --rm --memory=192m --memory-swap=192m \\
+#         zstd-nginx-test:ubuntu-24.04 \\
+#         pytest /opt/regression/test_workspace_rss.py::\\
+#             test_workspace_rss_shrinks_under_known_content_length
+#
+# 192m is the suggested starting point per plan: cgroup overhead +
+# nginx baseline ~64m + 200 x ~80 KiB workspace ~= ~80m -> ~144m total
+# with margin. Pre-auto-window this would OOM (200 x 5.5 MB = ~1.1 GB
+# of pinned workspace far exceeds 192m).
+
+
+# Distinct from any other test fixture port (test_proxy_flush uses 9004,
+# test_auto_window uses 9005).
+_AW_RSS_FIXTURE_PORT = 9006
+_AW_RSS_BODY_SIZE = 4096  # 4 KiB compressible body per plan
+
+
+def _aw_rss_body() -> bytes:
+    """Compressible 4 KiB pattern. Auto-window picks windowLog from
+    ceil(log2(4096)) = 12 -> workspace ~80 KiB. Compressed bytes ~few
+    hundred, so the slow drain has to space out the read to actually
+    hold the response open for the duration of the test."""
+    pattern = (
+        b"The quick brown fox jumps over the lazy dog. "
+        b"Sphinx of black quartz, judge my vow.\n"
+    )
+    reps = (_AW_RSS_BODY_SIZE + len(pattern) - 1) // len(pattern)
+    return (pattern * reps)[:_AW_RSS_BODY_SIZE]
+
+
+def _aw_rss_handle(c: socket.socket) -> None:
+    """Minimal HTTP/1.1 upstream: serves a known-Content-Length 4 KiB
+    body regardless of request path. Connection: close after one
+    response (no keepalive needed for this test shape)."""
+    try:
+        c.settimeout(5)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = c.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        body = _aw_rss_body()
+        c.sendall(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n"
+            b"\r\n" + body
+        )
+    finally:
+        try:
+            c.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        c.close()
+
+
+def _aw_rss_server_loop(sock: socket.socket,
+                        stop_event: threading.Event) -> None:
+    sock.settimeout(0.5)
+    while not stop_event.is_set():
+        try:
+            c, _ = sock.accept()
+        except socket.timeout:
+            continue
+        threading.Thread(
+            target=_aw_rss_handle, args=(c,), daemon=True
+        ).start()
+
+
+def test_workspace_rss_shrinks_under_known_content_length():
+    """Sibling of test_concurrent_workspace_pinning_oom_guard.
+
+    Drives 200 concurrent async httpx clients against a proxy_pass
+    location whose upstream sets an explicit Content-Length: 4096. The
+    auto-window code path (introduced in commit 4ddc5c9) feeds the
+    Content-Length through ZSTD_getCParams + setParameter(windowLog), so
+    each in-flight CStream workspace is ~80 KiB rather than the
+    level-default ~5.5 MB.
+
+    Assertions:
+      (a) every request returns 200 + Content-Encoding: zstd
+      (b) decompressed body length matches input
+      (c) "zstd workspace exhausted" is ABSENT in the warn-level
+          error_log (the bump-allocator-fit invariant still holds with
+          the smaller auto-tuned ws_size + headroom)
+      (d) no request raises (worker not OOM-killed; if launched under a
+          docker --memory cap below ~1.1 GB, this discriminates the
+          regression where auto-tune is reverted)
+    """
+    concurrency = int(os.environ.get("ZSTD_AW_CONCURRENCY", "200"))
+    drain_rate_kib_s = 4  # one 4 KiB chunk per second per client
+    chunk_size = 1024
+    sleep_per_chunk_s = chunk_size / (drain_rate_kib_s * 1024)
+    per_request_timeout_s = 30.0
+    log_path = Path("/tmp/zstd-aw-rss-test.log")
+    log_path.unlink(missing_ok=True)
+
+    # Upstream fixture: function-scoped because this test owns its own
+    # nginx lifecycle (custom error_log + proxy_pass location).
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("127.0.0.1", _AW_RSS_FIXTURE_PORT))
+    sock.listen(64)
+    stop_event = threading.Event()
+    server_thread = threading.Thread(
+        target=_aw_rss_server_loop,
+        args=(sock, stop_event),
+        daemon=True,
+    )
+    server_thread.start()
+
+    stop_nginx()
+    render_template(
+        extra_directives=(
+            f"error_log {log_path} warn;\n"
+            "zstd_comp_level 6;"
+        ),
+        extra_locations=(
+            "location /aw-rss/ {\n"
+            f"    proxy_pass http://127.0.0.1:{_AW_RSS_FIXTURE_PORT}/;\n"
+            "    proxy_http_version 1.1;\n"
+            "    proxy_buffering on;\n"
+            "}\n"
+        ),
+    )
+    start_nginx()
+
+    url = f"{BASE_URL}/aw-rss/body"
+
+    async def slow_drain_request(client: httpx.AsyncClient) -> int:
+        # Same shape as test_concurrent_workspace_pinning_oom_guard:
+        # stream + aiter_raw to bypass httpx's auto-zstd decoder and
+        # validate the wire bytes are an actual zstd frame.
+        async with client.stream(
+            "GET", url, headers={"Accept-Encoding": "zstd"},
+        ) as r:
+            assert r.status_code == 200, f"status={r.status_code}"
+            assert r.headers.get("content-encoding") == "zstd", (
+                f"ce={r.headers.get('content-encoding')!r}"
+            )
+            body = bytearray()
+            async for chunk in r.aiter_raw(chunk_size=chunk_size):
+                body.extend(chunk)
+                await asyncio.sleep(sleep_per_chunk_s)
+        assert bytes(body[:4]) == b"\x28\xb5\x2f\xfd", (
+            f"missing zstd magic; first16={bytes(body[:16]).hex()}"
+        )
+        return len(body)
+
+    async def run_all() -> list:
+        limits = httpx.Limits(
+            max_connections=concurrency + 10,
+            max_keepalive_connections=concurrency + 10,
+        )
+        async with httpx.AsyncClient(
+            timeout=per_request_timeout_s, limits=limits,
+        ) as client:
+            return await asyncio.gather(
+                *(slow_drain_request(client) for _ in range(concurrency)),
+                return_exceptions=True,
+            )
+
+    try:
+        start = time.monotonic()
+        results = asyncio.run(run_all())
+        elapsed_s = time.monotonic() - start
+        time.sleep(0.1)  # let nginx flush any deferred WARN entries
+    finally:
+        stop_nginx()
+        stop_event.set()
+        server_thread.join(timeout=2)
+        sock.close()
+
+    failures = [r for r in results if isinstance(r, BaseException)]
+    assert not failures, (
+        f"{len(failures)}/{concurrency} slow-drain requests failed.\n"
+        f"First 3 errors: "
+        f"{[type(f).__name__ + ': ' + str(f)[:200] for f in failures[:3]]}\n"
+        f"Probable causes: (a) worker OOM-killed because auto-window "
+        f"regressed and per-request workspace returned to level-default "
+        f"size (200 x ~5.5 MB = ~1.1 GB pinned -- only discriminative "
+        f"under docker --memory cap); (b) filter SEGV under concurrent "
+        f"customAlloc; (c) bump-allocator-fit underestimate -> ALERT "
+        f"fallback path (see error_log assertion below)."
+    )
+
+    sizes = sorted(results)
+    # Compressed 4 KiB of the repeating pattern should be very small
+    # (typically <300 B). Floor at 10 B guards against degenerate
+    # responses; ceiling at the input size guards against an
+    # uncompressed pass-through being silently treated as zstd.
+    assert sizes[0] >= 10, (
+        f"smallest response only {sizes[0]} bytes -- response shape "
+        f"is wrong (truncation? upstream error?)"
+    )
+    assert sizes[-1] <= _AW_RSS_BODY_SIZE, (
+        f"largest response {sizes[-1]} bytes > input {_AW_RSS_BODY_SIZE}"
+        f" -- compression failed open or auto-window broke ratio"
+    )
+
+    # Vacuous-pass guard: error_log must exist (directive applied).
+    assert log_path.exists(), (
+        f"expected error_log at {log_path}; directive did not apply or "
+        f"nginx never logged. Fix the test harness before treating "
+        f"workspace-exhausted as 'never fires'."
+    )
+    log_content = log_path.read_text()
+    assert "zstd workspace exhausted" not in log_content, (
+        f"Bump-allocator-fit invariant violated under auto-window: the "
+        f"ZSTD_estimateCStreamSize_usingCParams budget did not cover "
+        f"libzstd's actual workspace demand for srcSize="
+        f"{_AW_RSS_BODY_SIZE}. Fallback path fired. Log content:\n"
+        f"{log_content}"
+    )
+
+    print(
+        f"\n[aw-rss] {concurrency} slow-drain known-C-L requests in "
+        f"{elapsed_s:.1f}s, drain rate {drain_rate_kib_s} KiB/s, "
+        f"compressed sizes {sizes[0]}..{sizes[-1]} bytes "
+        f"(input {_AW_RSS_BODY_SIZE} B)"
     )
 
 

@@ -13,6 +13,7 @@ zstd-nginx-module - Nginx module for the [Zstandard compression](https://faceboo
     * [zstd](#zstd)
     * [zstd_comp_level](#zstd_comp_level)
     * [zstd_min_length](#zstd_min_length)
+    * [zstd_window_bits](#zstd_window_bits)
     * [zstd_types](#zstd_types)
     * [zstd_buffers](#zstd_buffers)
   * [ngx_http_zstd_static_module](#ngx_http_zstd_static_module)
@@ -112,6 +113,14 @@ The Accept-Encoding header is parsed per RFC 9110. `zstd;q=0` explicitly disable
 
 Sets a zstd compression level of a response. Acceptable values are in the range from 1 to `ZSTD_maxCLevel()`.
 
+When the response `Content-Length` is known, the filter now derives per-request
+`windowLog` / `hashLog` / `chainLog` from `ZSTD_getCParams(level, content_length, 0)`
+and sizes the per-request workspace accordingly. The effective compression level
+is unchanged — only the auxiliary parameter set is right-sized to the body.
+For chunked or unknown-length responses the level defaults still apply (see
+[`zstd_window_bits`](#zstd_window_bits) if you also want to bound memory for
+those responses).
+
 ### zstd_min_length
 
 **Syntax:** *zstd_min_length length;*  
@@ -119,6 +128,72 @@ Sets a zstd compression level of a response. Acceptable values are in the range 
 **Context:** *http, server, location*
 
 Sets the minimum length of a response that will be compressed by zstd. The length is determined only from the `Content-Length` response header field.
+
+### zstd_window_bits
+
+**Syntax:** *zstd_window_bits N;*  
+**Default:** *-* (unset — no cap)  
+**Context:** *http, server, location*
+
+Sets an upper cap on the per-request `windowLog` used by the compressor.
+The accepted range is whatever `ZSTD_cParam_getBounds(ZSTD_c_windowLog)`
+returns from the linked libzstd — typically `[10, 31]` on 64-bit builds and
+`[10, 30]` on 32-bit builds. Values outside the runtime bounds are rejected
+at config-parse time with a message naming the actual lower / upper bounds.
+
+This directive is a **cap on the auto-derived `windowLog`, not an
+exact-value setter**. The effective `windowLog` for a request is
+`min(auto_derived_windowLog, zstd_window_bits)`. This is a deliberate
+semantic departure from the 0.2.x-era port of `zstd_window_bits` (which
+forced an exact value) — if you are migrating from that variant, expect
+slightly smaller windows for small responses (auto-tune picks a snug fit)
+and the same window as before for responses larger than `2^N` bytes.
+
+**Chrome browser compatibility.** Chrome rejects zstd responses whose
+frame header advertises `windowLog > 23` (see upstream issue #35 and the
+chromium tracker). At the default `zstd_comp_level 1` and even up through
+`zstd_comp_level 16`, the level-default `windowLog` stays at or below 23
+for response sizes up to 8 MiB, so the constraint is satisfied implicitly.
+However, `zstd_comp_level >= 17` raises the level-default `windowLog` to
+24 or higher, which Chrome will refuse. If you serve Chrome clients with
+`zstd_comp_level 17` or above, set `zstd_window_bits 23;` to keep
+responses decodable. Setting `zstd_window_bits 23;` unconditionally
+is also a reasonable forward-defense against future libzstd
+level-default shifts.
+
+Typical settings:
+
+* `zstd_window_bits 23;` — Chrome-compatibility ceiling.
+* `zstd_window_bits 20;` — pin to the level=6 default (~5.5 MiB workspace).
+* `zstd_window_bits 17;` — aggressive memory bound for constrained workers
+  (~1 MiB workspace per request).
+
+**Chunked / unknown-`Content-Length` responses.** The per-request
+auto-tune only fires when `Content-Length` is known. Chunked responses
+fall back to libzstd's level defaults. The `zstd_window_bits` cap, when
+set, applies to chunked responses too — making it the primary lever for
+bounding memory on streaming workloads.
+
+**Memory ≈ window relationship.** Approximate per-request workspace at
+`zstd_comp_level 6`, computed via `ZSTD_estimateCStreamSize_usingCParams`:
+
+| `windowLog` | window | workspace per request |
+|---|---|---|
+| 10 | 1 KiB | ~64 KiB |
+| 14 | 16 KiB | ~256 KiB |
+| 17 | 128 KiB | ~1 MiB |
+| 20 | 1 MiB | ~5.5 MiB (level=6 default) |
+| 23 | 8 MiB | ~40 MiB |
+| 27 | 128 MiB | ~600 MiB |
+
+Workspace grows roughly proportional to window size at low levels;
+hash/chain tables add overhead at higher `zstd_comp_level`. Memory is
+**per concurrent in-flight compression** — overall worker footprint is
+`worker_processes × max_concurrent_zstd_responses × workspace`. Direction A's
+eager-release frees each workspace immediately after the response
+completes, so slow-client back-pressure does not multiply the bound.
+These numbers are reference points only; measure with `$zstd_ratio` and
+RSS sampling for production sizing.
 
 ### zstd_types
 
@@ -158,6 +233,15 @@ With the _"always"_ value, "zstd" file is used in all cases, without checking if
 ### $zstd_ratio
 
 Achieved compression ratio, computed as the ratio between the original and compressed response sizes.
+
+Auto-tune from `Content-Length` does not degrade `$zstd_ratio`:
+`ZSTD_getCParams(level, srcSize, 0)` always returns
+`windowLog >= ceil(log2(srcSize))`, so all back-references within the
+body remain reachable and the ratio matches the status-quo level-default
+configuration for any single response. Ratio CAN degrade only when the
+operator sets [`zstd_window_bits`](#zstd_window_bits) below
+`ceil(log2(response_size))`; that is an explicit, documented memory-vs-ratio
+trade-off.
 
 # Author
 

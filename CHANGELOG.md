@@ -5,6 +5,41 @@ All notable changes to this fork of zstd-nginx-module are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/tokers/zstd-nginx-module) at commit `057a7d3`.
 
+## [Unreleased]
+
+### Added
+
+- New `zstd_window_bits N;` directive (http / server / location). Sets an
+  upper cap on the per-request `windowLog`. Range validated at config-parse
+  time against the runtime `ZSTD_cParam_getBounds(ZSTD_c_windowLog)` (typically
+  `[10, 31]` on 64-bit, `[10, 30]` on 32-bit). Default is unset (no cap).
+  Recommended setting: `zstd_window_bits 23;` when serving Chrome clients
+  at `zstd_comp_level >= 17`, since Chrome rejects frame `windowLog > 23`.
+  See `README.md` for the memory ≈ window relationship table and migration
+  notes from the 0.2.x exact-value variant of this directive (semantics
+  differ — this release ships **cap semantics**, not exact value).
+
+### Changed
+
+- Per-request CStream auto-window. When the response `Content-Length` is
+  known, the filter now derives `windowLog` / `hashLog` / `chainLog` per
+  request via `ZSTD_getCParams(level, content_length, 0)` and sizes the
+  per-request workspace via `ZSTD_estimateCStreamSize_usingCParams`. For the
+  L1 production traffic profile (median body ~0.9 KiB, p70 < 16 KiB) this
+  shrinks the per-request workspace from the ~5.5 MiB level=6 baseline to
+  ~64–256 KiB — roughly a 20–80× reduction at the bump-allocator chunk
+  level, freed eagerly via Direction A's pool-free path. Compression ratio
+  is unaffected for any single response because the auto-derived window is
+  always large enough to span the body. Chunked / unknown-`Content-Length`
+  responses fall back to the level defaults and are byte-identical to the
+  previous release — **fully backward-compatible**.
+- Forward-compat guard. The auto-tune path validates that the
+  per-request workspace estimate never exceeds the level-default baseline
+  computed at config init (`ZSTD_estimateCStreamSize(level)`); on any
+  violation the request transparently falls back to the level-default
+  workspace. Defends against future libzstd heuristic regressions that
+  could return larger cParams for the same level + srcSize.
+
 ## [0.3.0] - 2026-05-18
 
 ### Changed
