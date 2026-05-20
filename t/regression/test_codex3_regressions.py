@@ -275,18 +275,6 @@ def static_gzip_nginx():
         stop_nginx()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "P2.2 (docs/codex3.md): zstd_static handler sets "
-        "r->gzip_tested=1; r->gzip_ok=0 in ngx_http_zstd_ok() BEFORE "
-        "probing the .zst sidecar. When the sidecar is missing the "
-        "handler returns NGX_DECLINED without resetting those flags, "
-        "and nginx core's gzip filter short-circuits — clients lose "
-        "gzip on plain-only assets. Fix: either probe the file first, "
-        "or reset r->gzip_tested/gzip_ok on the NGX_DECLINED paths."
-    ),
-)
 def test_gzip_survives_missing_zst_sidecar(static_gzip_nginx):
     """BUG reproduction: AE=gzip,zstd → .zst missing → expect gzip.
 

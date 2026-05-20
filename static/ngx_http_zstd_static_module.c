@@ -216,6 +216,15 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
 
     r->root_tested = !r->error_page;
 
+    /* Committed to serving the precompressed .zst sidecar — block the
+     * downstream gzip filter from re-compressing it. Set here (after
+     * every NGX_DECLINED / NGX_HTTP_NOT_FOUND branch above) so that a
+     * missing sidecar does NOT poison gzip eligibility for clients
+     * sending `AE: gzip, zstd` (P2.2 fix, docs/codex3.md). Applies to
+     * both `zstd_static on` and `always` modes. */
+    r->gzip_tested = 1;
+    r->gzip_ok = 0;
+
     rc = ngx_http_discard_request_body(r);
     if (rc != NGX_OK) {
         return rc;
@@ -283,6 +292,15 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
 }
 
 
+/*
+ * Pure predicate: returns NGX_OK iff the client advertises a non-zero-q
+ * "zstd" token in Accept-Encoding. No side effects on r->gzip_*; the
+ * caller flips r->gzip_tested / r->gzip_ok only after committing to
+ * serve the precompressed sidecar (P2.2 fix — see handler below). The
+ * old version poisoned gzip eligibility here, which was visible to
+ * clients sending `AE: gzip, zstd` when the .zst sidecar was absent and
+ * the handler fell through to NGX_DECLINED.
+ */
 static ngx_int_t
 ngx_http_zstd_ok(ngx_http_request_t *r)
 {
@@ -301,15 +319,7 @@ ngx_http_zstd_ok(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    if (ngx_http_zstd_accept_encoding(&ae->value) != NGX_OK) {
-        return NGX_DECLINED;
-    }
-
-
-    r->gzip_tested = 1;
-    r->gzip_ok = 0;
-
-    return NGX_OK;
+    return ngx_http_zstd_accept_encoding(&ae->value);
 }
 
 
