@@ -99,8 +99,15 @@ if [ -z "${ZSTD_TEST_SKIP_BUILD:-}" ]; then
     bake_log="${LOG_DIR}/_bake.log"
     echo "=== matrix-parallel: bake ${#BAKE_TARGETS[@]} targets in parallel ==="
     echo "  log: ${bake_log}"
+    # --load: write the built images into the local docker image store so
+    # `docker run zstd-nginx-test:<variant>` (in t/run.sh) can find them.
+    # Without --load the default `docker-container` buildx driver leaves
+    # results in the BuildKit cache only, and t/run.sh's `docker images -q`
+    # presence check fails on a clean machine. Equivalent long form is
+    # `--set "*.output=type=docker"`.
     if ! docker buildx bake \
             -f t/docker/docker-bake.hcl \
+            --load \
             ${ZSTD_TEST_PLATFORM:+--set "*.platform=$ZSTD_TEST_PLATFORM"} \
             "${BAKE_TARGETS[@]}" \
             > "$bake_log" 2>&1; then

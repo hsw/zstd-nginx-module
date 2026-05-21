@@ -125,6 +125,12 @@ run_variant() {
     # Conditional --platform: empty ZSTD_TEST_PLATFORM = docker picks native.
     local platform_flag=()
     [ -n "${ZSTD_TEST_PLATFORM:-}" ] && platform_flag=(--platform "$ZSTD_TEST_PLATFORM")
+    # Per-variant host scratch files so concurrent t/matrix-parallel.sh
+    # subshells don't clobber each other's diagnostics. Without this, six
+    # parallel `t/run.sh` instances all writing to /tmp/docker-run.err race
+    # on every startup error.
+    local docker_run_err="/tmp/zstd-docker-run-${variant}.err"
+    local nginx_start_err="/tmp/zstd-nginx-start-${variant}.err"
     if ! cid="$(docker run -d --rm \
             ${platform_flag[@]+"${platform_flag[@]}"} \
             --name "$cname" \
@@ -134,9 +140,9 @@ run_variant() {
             --entrypoint sleep \
             "$image" \
             infinity \
-            2>/tmp/docker-run.err)"; then
+            2>"$docker_run_err")"; then
         echo "run.sh: docker run failed for ${variant}:" >&2
-        cat /tmp/docker-run.err >&2 || true
+        cat "$docker_run_err" >&2 || true
         variant_inc_fail "$variant"
         SUMMARY_LINES+=("${variant}/<docker-run>: fail")
         return
@@ -162,7 +168,13 @@ run_variant() {
         -e 's|__SERVER_PORT__|8080|' \
         /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf"
     docker exec "$cid" sed -i 's|^daemon off;|daemon on;|' /etc/nginx/nginx.conf >/dev/null 2>&1 || true
-    docker exec "$cid" nginx -c /etc/nginx/nginx.conf >/tmp/nginx-start.err 2>&1 || true
+    # Capture nginx's stdout+stderr INSIDE the container by running the
+    # redirect under `sh -c` (so the `>` is interpreted by the container
+    # shell, not the host shell). Each variant has its own container, so the
+    # in-container /tmp/nginx-start.err does not race under parallel runs.
+    # The host-side stderr of the `docker exec` itself goes to the per-variant
+    # $nginx_start_err host path.
+    docker exec "$cid" sh -c 'nginx -c /etc/nginx/nginx.conf > /tmp/nginx-start.err 2>&1' 2>"$nginx_start_err" || true
 
     local i=0
     while ! curl -fsS --max-time 1 "http://127.0.0.1:${ZSTD_TEST_PORT}/" >/dev/null 2>&1; do
@@ -170,6 +182,7 @@ run_variant() {
         if [ "$i" -ge 60 ]; then
             echo "run.sh: container ${variant} did not listen on ${ZSTD_TEST_PORT} within 30s" >&2
             docker exec "$cid" cat /tmp/nginx-start.err >&2 2>/dev/null || true
+            cat "$nginx_start_err" >&2 2>/dev/null || true
             docker logs "$cid" >&2 || true
             docker stop "$cid" >/dev/null 2>&1 || true
             variant_inc_fail "$variant"
