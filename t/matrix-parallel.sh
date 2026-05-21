@@ -45,21 +45,35 @@ ALL_VARIANTS=(
     ubuntu-24.04-dynamic-brotli
 )
 
-# Map variant slug → bake target name (HCL identifiers can't contain dots).
+# Map variant slug → bake target name. HCL identifiers can't contain dots,
+# so the bake file uses dashes throughout (ubuntu-24-04 etc.). A simple
+# `tr` covers every variant in ALL_VARIANTS — no per-variant case branch
+# needed.
 bake_target() {
-    case "$1" in
-        ubuntu-22.04)                 echo "ubuntu-22-04" ;;
-        ubuntu-24.04)                 echo "ubuntu-24-04" ;;
-        ubuntu-24.04-shared-only)     echo "ubuntu-24-04-shared-only" ;;
-        ubuntu-26.04)                 echo "ubuntu-26-04" ;;
-        ubuntu-24.04-brotli)          echo "ubuntu-24-04-brotli" ;;
-        ubuntu-24.04-dynamic-brotli)  echo "ubuntu-24-04-dynamic-brotli" ;;
-        *)                             echo "" ;;
-    esac
+    echo "$1" | tr '.' '-'
 }
 
 if [ "$#" -gt 0 ]; then
     VARIANTS=("$@")
+    # Validate user-supplied variant names up front so a typo fails fast
+    # with a clear message, instead of falling through to a noisy bake or
+    # `t/run.sh` error a few minutes later. Angie variants are on-demand
+    # only (see CLAUDE.md) — invoke `bash t/build.sh angie-<NN.NN>`
+    # directly if you need them.
+    for v in "${VARIANTS[@]}"; do
+        ok=0
+        for known in "${ALL_VARIANTS[@]}"; do
+            if [ "$v" = "$known" ]; then
+                ok=1
+                break
+            fi
+        done
+        if [ "$ok" -eq 0 ]; then
+            echo "matrix-parallel: unknown variant '$v'." >&2
+            echo "  known variants: ${ALL_VARIANTS[*]}" >&2
+            exit 2
+        fi
+    done
 else
     VARIANTS=("${ALL_VARIANTS[@]}")
 fi
@@ -73,45 +87,27 @@ mkdir -p "$LOG_DIR"
 # ----------------------------------------------------------------------------
 
 if [ -z "${ZSTD_TEST_SKIP_BUILD:-}" ]; then
-    # Resolve bake target names. If any variant has no bake mapping (e.g.
-    # angie-NN.NN), fall back to a sequential `t/build.sh <variant>` for
-    # those — bake doesn't know about them and we don't want to silently
-    # skip.
-    declare -a BAKE_TARGETS NON_BAKE_VARIANTS
+    # All ALL_VARIANTS entries have a corresponding bake target — the
+    # input-validation above guarantees we only see variants from that
+    # set, so a single `docker buildx bake` call covers every variant.
+    declare -a BAKE_TARGETS
     BAKE_TARGETS=()
-    NON_BAKE_VARIANTS=()
     for v in "${VARIANTS[@]}"; do
-        t="$(bake_target "$v")"
-        if [ -n "$t" ]; then
-            BAKE_TARGETS+=("$t")
-        else
-            NON_BAKE_VARIANTS+=("$v")
-        fi
+        BAKE_TARGETS+=("$(bake_target "$v")")
     done
 
     bake_log="${LOG_DIR}/_bake.log"
     echo "=== matrix-parallel: bake ${#BAKE_TARGETS[@]} targets in parallel ==="
     echo "  log: ${bake_log}"
-    if [ "${#BAKE_TARGETS[@]}" -gt 0 ]; then
-        if ! docker buildx bake \
-                -f t/docker/docker-bake.hcl \
-                ${ZSTD_TEST_PLATFORM:+--set "*.platform=$ZSTD_TEST_PLATFORM"} \
-                ${BAKE_TARGETS[@]+"${BAKE_TARGETS[@]}"} \
-                > "$bake_log" 2>&1; then
-            echo "matrix-parallel: bake FAILED — see ${bake_log}" >&2
-            tail -n 40 "$bake_log" | sed 's/^/    /' >&2
-            exit 2
-        fi
+    if ! docker buildx bake \
+            -f t/docker/docker-bake.hcl \
+            ${ZSTD_TEST_PLATFORM:+--set "*.platform=$ZSTD_TEST_PLATFORM"} \
+            "${BAKE_TARGETS[@]}" \
+            > "$bake_log" 2>&1; then
+        echo "matrix-parallel: bake FAILED — see ${bake_log}" >&2
+        tail -n 40 "$bake_log" | sed 's/^/    /' >&2
+        exit 2
     fi
-
-    # Sequential build for variants not in the bake file (angie-* etc.)
-    for v in ${NON_BAKE_VARIANTS[@]+"${NON_BAKE_VARIANTS[@]}"}; do
-        echo "  -> ${v}: sequential build (not in bake)"
-        if ! bash t/build.sh "$v" >> "$bake_log" 2>&1; then
-            echo "matrix-parallel: build FAILED for ${v}" >&2
-            exit 2
-        fi
-    done
     echo "matrix-parallel: build phase done"
 else
     echo "=== matrix-parallel: ZSTD_TEST_SKIP_BUILD=1, skipping build ==="

@@ -1,8 +1,8 @@
-"""TDD reproductions for the codex3 review findings (docs/codex3.md).
+"""Regression tests for the codex3 review findings (docs/codex3.md).
 
-Each test below is currently xfail(strict=True) — the bug it captures is
-not yet fixed. When the fix lands the xfail flips strict-pass and the
-marker is removed.
+These were originally TDD reproductions marked xfail(strict=True); the
+fixes have landed (commits flipping xfail → strict-pass and removing the
+markers) and the tests now guard against re-regression.
 
 Bugs covered:
 
@@ -153,8 +153,8 @@ def test_dict_direct_uses_configured_dict(dict_inherit_nginx):
     body filter emits the dict-skipped auto-window marker.
 
     If this test ever goes red it means the dict load path itself is
-    broken — the dict-inherit xfail below is meaningless until this
-    passes."""
+    broken — the dict-inherit regression test below depends on this
+    baseline working."""
     r, body = http_request(
         dict_inherit_nginx, "/dict-direct/page.html",
         accept_encoding="zstd",
@@ -197,22 +197,22 @@ def test_dict_inherited_through_off_parent(dict_inherit_nginx):
     )
 
 
-def test_dict_inherited_through_on_off_on_chain(dict_inherit_nginx):
-    """Inverse-shape sanity: http `zstd on` + dict_file, server
-    `zstd off`, location `zstd on` (same default level=1). After the
-    P2.1 fix the child reload-from-file branch fires (prev->dict is
-    NULL because parent merged with enable=0), so the configured dict
-    is loaded and the body filter emits the dict-skipped marker.
+def test_dict_marker_emitted_exactly_once_per_request(dict_inherit_nginx):
+    """Same config as test_dict_inherited_through_off_parent, but
+    asserts the dict-skipped marker is emitted exactly once per
+    compressed request (not zero, not more than one).
 
-    Also verifies the fix doesn't double-load: each compressed request
-    must emit the dict-skipped marker exactly once (one body-filter
-    pass → one log line), proving we use a single CDict per
-    request, not one per merge-level encountered on the conf chain.
+    Together with the inheritance test above this rules out two
+    distinct refactor regressions: (a) child fails to load the dict
+    and emits no marker (the P2.1 bug); (b) child loads the dict
+    multiple times per request, or emits the marker once per merge
+    level traversed on the conf chain — either of which would inflate
+    the marker count above one. Single body-filter pass should produce
+    exactly one log line.
     """
-    # Truncate the log so we count markers from this request only.
-    if LOG_PATH.exists():
-        LOG_PATH.write_text("")
-
+    # The dict_inherit_nginx fixture is function-scoped and
+    # _start_with_log unlinks LOG_PATH on every setup, so the log only
+    # contains lines from this one request.
     r, body = http_request(
         dict_inherit_nginx, "/dict-inherit/page.html",
         accept_encoding="zstd",
@@ -284,6 +284,12 @@ def static_gzip_nginx():
             alias {GZIP_FIXTURE_DIR}/;
             default_type text/plain;
         }}
+
+        location /static-poison-always/ {{
+            zstd_static always;
+            alias {GZIP_FIXTURE_DIR}/;
+            default_type text/plain;
+        }}
 """
     stop_nginx()
     _start_with_log(
@@ -297,6 +303,33 @@ def static_gzip_nginx():
         stop_nginx()
 
 
+def _assert_gzip_passthrough(r, body, *, label: str, check_body_sanity: bool = True):
+    """Shared assertion for the three .zst-missing → gzip-passthrough
+    tests. `label` is woven into the error message so the failing test
+    is identifiable in the assertion output. GET variants pass
+    check_body_sanity=True to also verify the fixture is large enough
+    for compression to be visibly smaller than the source; HEAD passes
+    False since there is no body to size-check.
+    """
+    assert r.status_code == 200, f"{label}: status={r.status_code}"
+    enc = r.headers.get("Content-Encoding")
+    if check_body_sanity:
+        # Sanity: the plain file is much larger than its gzip output. If
+        # gzip ran the body would be far smaller than the source.
+        plain_size = GZIP_PLAIN.stat().st_size
+        assert plain_size > 1024, "fixture sanity"
+        assert enc == "gzip", (
+            f"{label}: expected Content-Encoding=gzip when .zst is "
+            f"missing and AE='gzip, zstd', got {enc!r}; "
+            f"plain_size={plain_size} response_body_size={len(body)}"
+        )
+    else:
+        assert enc == "gzip", (
+            f"{label}: expected Content-Encoding=gzip when .zst is "
+            f"missing and AE='gzip, zstd', got {enc!r}"
+        )
+
+
 def test_gzip_survives_missing_zst_sidecar(static_gzip_nginx):
     """BUG reproduction: AE=gzip,zstd → .zst missing → expect gzip.
 
@@ -308,24 +341,45 @@ def test_gzip_survives_missing_zst_sidecar(static_gzip_nginx):
         static_gzip_nginx, "/static-poison/plain.txt",
         accept_encoding="gzip, zstd",
     )
-    assert r.status_code == 200, f"status={r.status_code}"
-    # Sanity: the plain file is much larger than its gzip output. If
-    # gzip ran the body would be far smaller than the source.
-    plain_size = GZIP_PLAIN.stat().st_size
-    assert plain_size > 1024, "fixture sanity"
-    enc = r.headers.get("Content-Encoding")
-    assert enc == "gzip", (
-        f"expected Content-Encoding=gzip when .zst is missing and "
-        f"AE='gzip, zstd', got {enc!r}; "
-        f"plain_size={plain_size} response_body_size={len(body)}"
+    _assert_gzip_passthrough(r, body, label="zstd_static on")
+
+
+def test_gzip_survives_missing_zst_sidecar_always_mode(static_gzip_nginx):
+    """Same shape as test_gzip_survives_missing_zst_sidecar but exercises
+    `zstd_static always`. The handler bypasses ngx_http_zstd_ok() in
+    always mode, but the fixed gzip-preempt commit point still sits past
+    the file-probe branches — a missing sidecar must fall through cleanly
+    without poisoning gzip eligibility. This is the coverage gap that
+    review T1 flagged."""
+    r, body = http_request(
+        static_gzip_nginx, "/static-poison-always/plain.txt",
+        accept_encoding="gzip, zstd",
     )
+    _assert_gzip_passthrough(r, body, label="zstd_static always")
+
+
+def test_gzip_survives_missing_zst_sidecar_head_method(static_gzip_nginx):
+    """HEAD requests run through the same handler entry point and hit
+    the same gzip-preempt commit point before the `r->header_only`
+    short-circuit at ngx_http_send_header. A missing sidecar on HEAD
+    must also leave gzip eligibility intact — there is no body to
+    compress, but the Content-Encoding header still has to be set so
+    that intermediaries cache the response under the right key.
+    """
+    r, body = http_request(
+        static_gzip_nginx, "/static-poison/plain.txt",
+        method="HEAD",
+        accept_encoding="gzip, zstd",
+    )
+    _assert_gzip_passthrough(r, body, label="HEAD", check_body_sanity=False)
 
 
 def test_gzip_works_when_zstd_static_off(static_gzip_nginx):
     """Negative control: same fixture but a path with no static
     handler binding — gzip must compress the plain file. This proves
     gzip is enabled in the test image and the fixture content is
-    compressible, so the xfail above isolates the static-handler bug."""
+    compressible, so the regression test above isolates the
+    static-handler bug."""
     # The root location of the template runs gzip but doesn't bind
     # zstd_static, so a GET to a path the static module declines
     # (e.g. /text) must come back gzipped.

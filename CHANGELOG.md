@@ -55,7 +55,11 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   gzip compression on every plain-file miss. The AE-acceptance predicate
   is now pure; gzip preemption is committed only after the sidecar is
   successfully opened and we are about to serve the precompressed payload.
-  (codex3 P2.2.)
+  This applies to both `zstd_static on` and `zstd_static always` modes —
+  `always` previously never invoked `ngx_http_zstd_ok()`, so the gzip
+  flags were not set; they are now set at the commit point in both modes
+  for parity (we always serve precompressed `.zst` and want to block
+  downstream gzip re-compression). (codex3 P2.2.)
 - `ngx_http_zstd_filter_module` dict inheritance no longer silently drops a
   configured `zstd_dict_file` when an intermediate config block disabled
   the filter. The `merge_loc_conf` level-match branch inherited

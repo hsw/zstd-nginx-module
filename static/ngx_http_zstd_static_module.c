@@ -292,15 +292,8 @@ ngx_http_zstd_static_handler(ngx_http_request_t *r)
 }
 
 
-/*
- * Pure predicate: returns NGX_OK iff the client advertises a non-zero-q
- * "zstd" token in Accept-Encoding. No side effects on r->gzip_*; the
- * caller flips r->gzip_tested / r->gzip_ok only after committing to
- * serve the precompressed sidecar (P2.2 fix — see handler below). The
- * old version poisoned gzip eligibility here, which was visible to
- * clients sending `AE: gzip, zstd` when the .zst sidecar was absent and
- * the handler fell through to NGX_DECLINED.
- */
+/* Pure AE-acceptance predicate, no side effects on r->gzip_*. See the
+ * call site in the handler for the P2.2 rationale. */
 static ngx_int_t
 ngx_http_zstd_ok(ngx_http_request_t *r)
 {
