@@ -47,6 +47,24 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Fixed
 
+- `ngx_http_zstd_static_module` no longer poisons downstream gzip when the
+  `.zst` sidecar is absent. `ngx_http_zstd_ok()` previously set
+  `r->gzip_tested = 1; r->gzip_ok = 0;` before probing the file; on
+  `NGX_ENOENT` the handler returned `NGX_DECLINED` with gzip eligibility
+  already cleared, so clients sending `Accept-Encoding: gzip, zstd` lost
+  gzip compression on every plain-file miss. The AE-acceptance predicate
+  is now pure; gzip preemption is committed only after the sidecar is
+  successfully opened and we are about to serve the precompressed payload.
+  (codex3 P2.2.)
+- `ngx_http_zstd_filter_module` dict inheritance no longer silently drops a
+  configured `zstd_dict_file` when an intermediate config block disabled
+  the filter. The `merge_loc_conf` level-match branch inherited
+  `prev->dict` without checking whether the parent ever loaded one; a
+  `http { zstd_dict_file …; server { zstd off; location /a { zstd on; } } }`
+  shape produced `server->dict == NULL` (parent merged with `enable=0`),
+  which the child then inherited. The level-match branch now requires
+  `prev->dict != NULL` before inheriting, falling through to a fresh
+  `ZSTD_createCDict_byReference` otherwise. (codex3 P2.1.)
 - `ngx_http_zstd_filter_module` recycled output buffer no longer carries
   stale `b->flush` / `b->sync` / `b->last_buf` / `b->last_in_chain` from
   a prior use. After `ngx_chain_update_chains` returned the link to
@@ -74,6 +92,16 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   expects `NGX_CONF_OK` (which is `(char *) NULL`). No behavior change,
   but the typed return is correct per the nginx module contract and
   matches every other config callback in the module.
+
+### Testing
+
+- New parallel matrix runner: `t/matrix-parallel.sh` + `t/docker/docker-bake.hcl`
+  build and run the default 6-variant regression matrix concurrently
+  instead of the sequential `t/build.sh` + `t/run.sh` driver pair.
+  Observed ~6× wall-clock speedup on the local linux/amd64-via-Rosetta
+  loop. Logs land alongside the existing sequential outputs in
+  `tmp/run/<variant>/`. The sequential drivers remain the canonical
+  reference; the parallel runner is an iteration-time optimization.
 
 ### Build
 
