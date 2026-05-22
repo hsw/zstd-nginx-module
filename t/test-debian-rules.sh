@@ -81,32 +81,20 @@ if [ ! -f "$RULES" ]; then
     fail_count=$((fail_count + 1))
 fi
 
-# Both --add-dynamic-module= invocations must be present, one for each
-# module subdir. pkg-oss build_module.sh emits a single --add-dynamic-module
-# for one module per source tree; we ship two, so the configure step in
-# debian/rules MUST be customised.
+# Exactly ONE --add-dynamic-module= invocation, pointing at the repo root
+# ($(CURDIR)). The top-level config sources both filter/config and
+# static/config, so a single configure invocation produces BOTH .so
+# artefacts. Passing each subdir separately yields a doubled-path bug
+# (filter/config prepends `filter/` to source paths relative to
+# $ngx_addon_dir, so --add-dynamic-module=$(CURDIR)/filter resolves to
+# $(CURDIR)/filter/filter/ngx_http_zstd_filter_module.c at make time).
+# Mirrors t/docker/build-module.sh:84 (the proven test path).
 assert_grep_present "$RULES" \
-    '--add-dynamic-module=.*(MODULE_FILTER|filter)' \
-    "debian/rules configure includes --add-dynamic-module=...filter"
+    '--add-dynamic-module=\$\(CURDIR\)[[:space:]]*$' \
+    "debian/rules configure includes --add-dynamic-module=\$(CURDIR) (single flag, repo root)"
 
-assert_grep_present "$RULES" \
-    '--add-dynamic-module=.*(MODULE_STATIC|static)' \
-    "debian/rules configure includes --add-dynamic-module=...static"
-
-# Build-Depends must include libzstd-dev — the filter module links libzstd.
-# debhelper-compat is the dh sequencer version pin. libzstd-dev is OUR
-# addition over pkg-oss default.
-assert_grep_present "$CONTROL_IN" \
-    'Build-Depends:.*libzstd-dev' \
-    "debian/control.in Build-Depends contains libzstd-dev"
-
-# Build-Depends must NOT reference nginx-dev. Ubuntu's nginx-dev depends on
-# Ubuntu's distro nginx (~1.24), which conflicts with the nginx.org mainline
-# `nginx` package the CI build job installs. Instead, the build pulls the
-# matching nginx source tarball into /usr/local/src/nginx/ and compiles
-# against that — so nginx-dev is neither needed nor desired here. This
-# assertion guards against a future re-scaffold from pkg-oss accidentally
-# re-introducing the nginx-dev build-dep.
+# Guard against re-introduction of the doubled-path bug: no
+# --add-dynamic-module pointing at a /filter or /static subdir.
 assert_grep_absent() {
     local file="$1"
     local pattern="$2"
@@ -124,6 +112,27 @@ assert_grep_absent() {
         pass_count=$((pass_count + 1))
     fi
 }
+# Match only configure-line invocations (no leading `#` comment). Tab or
+# leading whitespace + --add-dynamic-module= pointing at /filter or /static
+# subdir, or referencing the old MODULE_FILTER/MODULE_STATIC Make variables.
+assert_grep_absent "$RULES" \
+    '^[[:space:]]+--add-dynamic-module=.*(MODULE_FILTER|MODULE_STATIC|/filter|/static)' \
+    "debian/rules does NOT pass per-subdir --add-dynamic-module (would cause doubled-path bug)"
+
+# Build-Depends must include libzstd-dev — the filter module links libzstd.
+# debhelper-compat is the dh sequencer version pin. libzstd-dev is OUR
+# addition over pkg-oss default.
+assert_grep_present "$CONTROL_IN" \
+    'Build-Depends:.*libzstd-dev' \
+    "debian/control.in Build-Depends contains libzstd-dev"
+
+# Build-Depends must NOT reference nginx-dev. Ubuntu's nginx-dev depends on
+# Ubuntu's distro nginx (~1.24), which conflicts with the nginx.org mainline
+# `nginx` package the CI build job installs. Instead, the build pulls the
+# matching nginx source tarball into /usr/local/src/nginx/ and compiles
+# against that — so nginx-dev is neither needed nor desired here. This
+# assertion guards against a future re-scaffold from pkg-oss accidentally
+# re-introducing the nginx-dev build-dep.
 assert_grep_absent "$CONTROL_IN" \
     'Build-Depends:.*nginx-dev' \
     "debian/control.in Build-Depends does NOT reference nginx-dev"

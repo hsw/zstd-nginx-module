@@ -3,15 +3,26 @@
 #
 # Scaffolded by hand following pkg-oss conventions (hg clone unavailable at
 # scaffold time). pkg-oss build_module.sh emits a single --add-dynamic-module
-# for one module per source tree; this file is customised to add BOTH the
-# filter and static modules from one source tree, producing two separate
-# .so artefacts that are split into two binary packages
-# (libnginx-mod-http-zstd-filter, libnginx-mod-http-zstd-static).
+# pointing at one module source dir; this tree ships TWO modules (filter and
+# static) but shares a single top-level `config` that sources both
+# `filter/config` and `static/config`. Therefore we pass ONE
+# --add-dynamic-module=$(CURDIR) — repo root — and a single configure+make
+# invocation produces BOTH .so artefacts, which dh_install then splits into
+# two binary packages (libnginx-mod-http-zstd-filter,
+# libnginx-mod-http-zstd-static).
+#
+# This mirrors t/docker/build-module.sh (the proven test harness path).
+# Passing each subdir as its own --add-dynamic-module is WRONG: filter/config
+# and static/config both prepend `filter/` / `static/` to their source paths
+# relative to $ngx_addon_dir (which they expect to be the repo root), so e.g.
+# --add-dynamic-module=$(CURDIR)/filter would yield a doubled path
+# `$(CURDIR)/filter/filter/ngx_http_zstd_filter_module.c` that `make modules`
+# cannot resolve.
 #
 # To re-scaffold from pkg-oss in the future:
 #   hg clone https://hg.nginx.org/pkg-oss && hg -R pkg-oss id
 # then run pkg-oss/build_module.sh against this tree and re-apply the
-# two-module configure customisation below.
+# single-flag-points-at-repo-root configure customisation below.
 #
 # Build-time env overrides:
 #   ZSTD_INC   — additional -I path for libzstd headers (consumed via $(if ...) below).
@@ -33,20 +44,20 @@ ZSTD_LD_OPT := $(if $(ZSTD_LIB),--with-ld-opt=-L$(ZSTD_LIB),)
 
 NGINX_SRC ?= /usr/local/src/nginx
 
-# Module subdirectories within this source tree.
-MODULE_FILTER := $(CURDIR)/filter
-MODULE_STATIC := $(CURDIR)/static
-
 %:
 	dh $@
 
 override_dh_auto_configure:
+	# Single --add-dynamic-module pointing at the repo root. The top-level
+	# `config` (at $(CURDIR)/config) sources both filter/config and
+	# static/config, producing BOTH .so artefacts from one configure+make.
+	# See the file header comment for why passing each subdir separately is
+	# wrong (doubled-path bug in `make modules`).
 	cd $(NGINX_SRC) && ./configure \
 	    --with-compat \
 	    $(ZSTD_CC_OPT) \
 	    $(ZSTD_LD_OPT) \
-	    --add-dynamic-module=$(MODULE_FILTER) \
-	    --add-dynamic-module=$(MODULE_STATIC)
+	    --add-dynamic-module=$(CURDIR)
 
 override_dh_auto_build:
 	# Builds modules into $(NGINX_SRC)/objs/. The nginx source tarball is
