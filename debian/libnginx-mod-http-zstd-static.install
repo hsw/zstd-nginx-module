@@ -1,0 +1,2 @@
+usr/lib/nginx/modules/ngx_http_zstd_static_module.so usr/lib/nginx/modules/
+debian/mod-http-zstd-static.conf usr/share/nginx/modules-available/

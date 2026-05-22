@@ -1,0 +1,73 @@
+#!/usr/bin/make -f
+# debian/rules — build the zstd-nginx-module dynamic modules under debhelper.
+#
+# Scaffolded by hand following pkg-oss conventions (hg clone unavailable at
+# scaffold time). pkg-oss build_module.sh emits a single --add-dynamic-module
+# for one module per source tree; this file is customised to add BOTH the
+# filter and static modules from one source tree, producing two separate
+# .so artefacts that are split into two binary packages
+# (libnginx-mod-http-zstd-filter, libnginx-mod-http-zstd-static).
+#
+# To re-scaffold from pkg-oss in the future:
+#   hg clone https://hg.nginx.org/pkg-oss && hg -R pkg-oss id
+# then run pkg-oss/build_module.sh against this tree and re-apply the
+# two-module configure customisation below.
+#
+# Build-time env overrides:
+#   ZSTD_INC   — additional -I path for libzstd headers (consumed via $(if ...) below).
+#                (default: empty; uses /usr/include via libzstd-dev)
+#   ZSTD_LIB   — additional -L path for libzstd library (consumed via $(if ...) below).
+#                (default: empty; uses /usr/lib via libzstd-dev)
+#   NGINX_SRC  — path to unpacked nginx source tree (consumed via `?=` default below).
+#                (default: /usr/src/nginx-source/, populated by nginx-dev)
+
+# Honour ZSTD_INC / ZSTD_LIB env overrides for cc-opt / ld-opt. Both vars
+# are empty in the default libzstd-dev path (CI uses /usr/include + /usr/lib)
+# so the --with-*-opt flags are emitted conditionally: passing an empty
+# --with-cc-opt="" overrides nginx-dev's default CFLAGS like `-g -O2 -Wformat`,
+# stripping hardening flags from the build. The $(if ...) guards drop the
+# flags entirely when the override env is unset.
+ZSTD_CC_OPT := $(if $(ZSTD_INC),--with-cc-opt=-I$(ZSTD_INC),)
+ZSTD_LD_OPT := $(if $(ZSTD_LIB),--with-ld-opt=-L$(ZSTD_LIB),)
+
+NGINX_SRC ?= /usr/src/nginx-source/
+
+# Module subdirectories within this source tree.
+MODULE_FILTER := $(CURDIR)/filter
+MODULE_STATIC := $(CURDIR)/static
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	cd $(NGINX_SRC) && ./configure \
+	    --with-compat \
+	    $(ZSTD_CC_OPT) \
+	    $(ZSTD_LD_OPT) \
+	    --add-dynamic-module=$(MODULE_FILTER) \
+	    --add-dynamic-module=$(MODULE_STATIC)
+
+override_dh_auto_build:
+	# Builds modules into $(NGINX_SRC)/objs/. nginx-dev's source tree at
+	# /usr/src/nginx-source/ is writable by root (the CI build user), so
+	# this works without an explicit copy. If that ever changes upstream,
+	# either copy $(NGINX_SRC) to a private build dir here, or override
+	# NGINX_SRC env from the caller.
+	$(MAKE) -C $(NGINX_SRC) modules
+
+override_dh_auto_install:
+	# Stage .so artefacts into debian/tmp/ so dh_install (driven by the
+	# two per-package .install files) can copy them into the per-package
+	# staging trees. dh_install resolves source paths RELATIVE to
+	# debian/tmp/ (or debian/<pkg>/), not from the host filesystem root —
+	# so the .so files cannot be referenced directly at /usr/src/...
+	# without first staging them into the package build area.
+	install -d $(CURDIR)/debian/tmp/usr/lib/nginx/modules
+	install -m 0644 $(NGINX_SRC)/objs/ngx_http_zstd_filter_module.so \
+	    $(CURDIR)/debian/tmp/usr/lib/nginx/modules/
+	install -m 0644 $(NGINX_SRC)/objs/ngx_http_zstd_static_module.so \
+	    $(CURDIR)/debian/tmp/usr/lib/nginx/modules/
+
+override_dh_auto_clean:
+	-cd $(NGINX_SRC) && $(MAKE) clean 2>/dev/null || true
+	dh_auto_clean

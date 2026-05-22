@@ -1,0 +1,2 @@
+usr/lib/nginx/modules/ngx_http_zstd_filter_module.so usr/lib/nginx/modules/
+debian/mod-http-zstd-filter.conf usr/share/nginx/modules-available/

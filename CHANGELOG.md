@@ -9,6 +9,15 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Added
 
+- GitHub Actions CI/CD: 3-variant test matrix on PR/push to `stable`;
+  `.deb` packaging via committed `debian/` + `dpkg-buildpackage`; full-matrix
+  release gate on `git tag v*`; `workflow_dispatch` for rebuilds against
+  newer nginx mainline; dry-run mode for safe fork testing.
+- `debian/prepare.sh` substitutes ABI-pin placeholders in `debian/control.in`
+  per pkg-oss floor/ceiling convention (LOWER = `X.Y.0`, UPPER = `X.(Y+1).0`).
+- `t/ci/install-nginx-mainline.sh` reusable nginx.org apt-repo bootstrap script.
+- Self-tests: `t/test-debian-prepare.sh`, `t/test-debian-rules.sh`,
+  `t/test-build-cache-env.sh`.
 - `ngx_http_zstd_static_module` now enables Range requests on `.zst`
   sidecars (sets `r->allow_ranges = 1` before `ngx_http_send_header`),
   matching nginx core `gzip_static`. Clients can now request byte ranges
@@ -26,6 +35,12 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Changed
 
+- `t/build.sh` now uses `docker buildx build --load` unconditionally
+  (replacing plain `docker build`); accepts `BUILDX_CACHE_FROM` /
+  `BUILDX_CACHE_TO` env vars for GitHub Actions layer-cache reuse; adds
+  `ZSTD_BUILD_DRYRUN=1` for dry-run testing of the resolved docker
+  buildx argv without invoking docker. Empty array expansions use the
+  `${arr[@]+"${arr[@]}"}` idiom for `set -u` survival.
 - Per-request CStream auto-window. When the response `Content-Length` is
   known, the filter now derives `windowLog` / `hashLog` / `chainLog` per
   request via `ZSTD_getCParams(level, content_length, 0)` and sizes the

@@ -306,6 +306,75 @@ else
     fail_count=$((fail_count + 1))
 fi
 
+# ---- release.yml ref validation (codex iter 8) --------------------------
+#
+# The "Validate ref/tag" step in .github/workflows/release.yml gates BOTH
+# entry paths — workflow_dispatch AND tag-push — by reading MODULE_REF from
+# `inputs.module_ref || github.ref_name`. A previous iteration accidentally
+# guarded the step with `if: github.event_name == 'workflow_dispatch'`,
+# silently letting tag-push bypass validation and allowing prerelease tags
+# like v0.3.0-rc.1 to dch-encode as a version dpkg sorts NEWER than v0.3.0.
+#
+# Without a regression test a future contributor could re-add that guard.
+# Static-grep the Validate step block and assert:
+#   (a) MODULE_REF env still has the `inputs.module_ref || github.ref_name`
+#       fallback that covers both event types.
+#   (b) The step has NO `if:` guard at all. The original narrow check rejected
+#       only the specific `if: github.event_name == 'workflow_dispatch'`
+#       form, but semantically equivalent bypasses
+#       (`!= 'push'`, `inputs.module_ref != ''`, compound `&&`/`||`,
+#       `!inputs.dry_run`, etc.) would slip through. The Validate step must
+#       run on every entry path so a hostile/malformed ref is rejected before
+#       any downstream job runs — codex iter 9 widens the assertion to match.
+
+echo
+echo "=== release.yml ref/tag validation gates both entry paths (codex iter 8) ==="
+
+RELEASE_YML="${REPO_ROOT}/.github/workflows/release.yml"
+
+if [ ! -f "$RELEASE_YML" ]; then
+    printf '  FAIL  release.yml missing at %s\n' "$RELEASE_YML"
+    fail_count=$((fail_count + 1))
+else
+    # Extract the Validate ref/tag step block: from its `- name:` line up to
+    # (but not including) the next `- name:` at the same indent.
+    validate_block=$(awk '
+        /^      - name: Validate ref\/tag/  { inside=1; print; next }
+        inside && /^      - name:/          { inside=0 }
+        inside                              { print }
+    ' "$RELEASE_YML")
+
+    if [ -z "$validate_block" ]; then
+        printf '  FAIL  could not locate "Validate ref/tag" step in release.yml\n'
+        fail_count=$((fail_count + 1))
+    else
+        # (a) MODULE_REF env must fall back: `inputs.module_ref || github.ref_name`.
+        if printf '%s\n' "$validate_block" | grep -qE 'MODULE_REF:[[:space:]]*\$\{\{[[:space:]]*inputs\.module_ref[[:space:]]*\|\|[[:space:]]*github\.ref_name'; then
+            printf '  PASS  Validate ref/tag MODULE_REF reads inputs.module_ref || github.ref_name (covers both entry paths)\n'
+            pass_count=$((pass_count + 1))
+        else
+            printf '  FAIL  Validate ref/tag MODULE_REF does not fall back to github.ref_name — tag-push would bypass validation\n'
+            fail_count=$((fail_count + 1))
+        fi
+
+        # (b) The Validate step must NOT have ANY `if:` guard. The step must
+        # run on every entry path so a hostile/malformed ref is rejected
+        # before any downstream job runs. Broader than checking for the
+        # specific workflow_dispatch-only guard because semantically
+        # equivalent bypasses (e.g. `if: github.event_name != 'push'`,
+        # `if: inputs.module_ref != ''`, any compound `&&`/`||` form that
+        # skips tag-push) would otherwise slip through.
+        if printf '%s\n' "$validate_block" | grep -qE '^[[:space:]]+if:[[:space:]]'; then
+            printf '  FAIL  Validate ref/tag has an if-guard (must run unconditionally to gate both push and dispatch)\n'
+            printf '         offending line: %s\n' "$(printf '%s\n' "$validate_block" | grep -E '^[[:space:]]+if:[[:space:]]' | head -1)"
+            fail_count=$((fail_count + 1))
+        else
+            printf '  PASS  Validate ref/tag runs unconditionally (no if-guard)\n'
+            pass_count=$((pass_count + 1))
+        fi
+    fi
+fi
+
 echo
 echo "=== summary ==="
 printf '  passed: %d\n' "$pass_count"

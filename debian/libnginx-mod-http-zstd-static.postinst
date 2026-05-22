@@ -1,0 +1,27 @@
+#!/bin/sh
+# postinst — enable the zstd static module by symlinking its load_module
+# snippet from /usr/share/nginx/modules-available/ into
+# /etc/nginx/modules-enabled/ on first `configure`. Mirrors the convention
+# used by Debian/Ubuntu's libnginx-mod-* packages (e.g. libnginx-mod-http-geoip):
+# nginx-common's stock config sources /etc/nginx/modules-enabled/*.conf, so the
+# symlink IS the enable mechanism. The 50- numeric prefix orders our module
+# alongside the stock libnginx-mod-* set (which all use 50-).
+#
+# Idempotent: `ln -sf` overwrites any existing symlink (including a stale
+# dangling one pointing at an old path), so a reinstall or `dpkg --configure -a`
+# re-run is harmless. A bare `[ -e link ]` guard would be unsafe here — it
+# returns false for dangling symlinks, after which `ln -s` fails under `set -e`
+# with "File exists". The matching postrm tears the symlink down on remove/purge.
+
+set -e
+
+case "$1" in
+    configure)
+        ln -sf /usr/share/nginx/modules-available/mod-http-zstd-static.conf \
+               /etc/nginx/modules-enabled/50-mod-http-zstd-static.conf
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

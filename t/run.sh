@@ -292,6 +292,29 @@ case "$rc" in
         ;;
 esac
 
+# Host-side CI plumbing regressions: debian/ packaging contract + t/build.sh
+# env passthrough. All three run in milliseconds, no Docker / network, so
+# they're invoked unconditionally on every t/run.sh pass (parity with
+# gate-semantics above) — keeps them from rotting silently.
+for ci_test in \
+    test-debian-prepare.sh \
+    test-debian-rules.sh \
+    test-build-cache-env.sh; do
+    label="${ci_test#test-}"
+    label="${label%.sh}"
+    echo "==> ${label} (host-side)"
+    if bash "${REPO_ROOT}/t/${ci_test}"; then
+        echo "  pass  ${label}"
+        variant_inc_pass "${label}"
+        SUMMARY_LINES+=("${label}: pass")
+    else
+        rc=$?
+        echo "  fail  ${label} rc=${rc}"
+        variant_inc_fail "${label}"
+        SUMMARY_LINES+=("${label}: fail (rc=${rc})")
+    fi
+done
+
 for v in "${VARIANTS[@]}"; do
     echo "==> ${v}"
     run_variant "$v"

@@ -20,6 +20,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# SHOULD mirror .github/workflows/release.yml's `test-full` job matrix
+# (the release gate runs the same default set). When adding/removing a
+# variant, update both this list AND release.yml's matrix to keep local
+# iteration and the release gate in sync.
 ALL_VARIANTS=(
     ubuntu-22.04
     ubuntu-24.04
@@ -47,8 +51,25 @@ fi
 PLATFORM="${ZSTD_TEST_PLATFORM:-}"
 # Conditional --platform flag: emits nothing when PLATFORM is empty,
 # so docker uses native. Avoids "--platform=" empty-value issues.
+# PLATFORM_FLAG and cache_args are declared empty unconditionally so the
+# ${arr[@]+"${arr[@]}"} expansion downstream survives `set -u` when no
+# overrides are in effect.
 PLATFORM_FLAG=()
 [ -n "$PLATFORM" ] && PLATFORM_FLAG=(--platform "$PLATFORM")
+
+# GHA buildx layer-cache passthrough. Empty by default → no cache flags
+# emitted, single code path. CI sets these to
+# `type=gha,scope=<variant>` / `type=gha,scope=<variant>,mode=max`.
+BUILDX_CACHE_FROM="${BUILDX_CACHE_FROM:-}"
+BUILDX_CACHE_TO="${BUILDX_CACHE_TO:-}"
+cache_args=()
+[ -n "$BUILDX_CACHE_FROM" ] && cache_args+=(--cache-from="$BUILDX_CACHE_FROM")
+[ -n "$BUILDX_CACHE_TO" ]   && cache_args+=(--cache-to="$BUILDX_CACHE_TO")
+
+# ZSTD_BUILD_DRYRUN=1 makes the loop print the resolved docker buildx argv
+# on stdout and skip the actual invocation. Used by t/test-build-cache-env.sh
+# to assert env-var passthrough without burning a real docker build.
+ZSTD_BUILD_DRYRUN="${ZSTD_BUILD_DRYRUN:-}"
 
 declare -a OK_LIST FAIL_LIST
 OK_LIST=()
@@ -106,16 +127,33 @@ for v in "${VARIANTS[@]}"; do
     fi
 
     image="zstd-nginx-test:${v}"
-    echo "==> building ${image} from ${dockerfile} (platform=${PLATFORM:-native} ${build_args[*]})"
-    if docker build \
+
+    if [ "$ZSTD_BUILD_DRYRUN" = "1" ]; then
+        # Print the resolved docker buildx argv on a single stdout line and
+        # skip the actual invocation. The ${arr[@]+"${arr[@]}"} idiom keeps
+        # `set -u` happy when PLATFORM_FLAG / cache_args are empty.
+        printf 'docker buildx build --load'
+        printf ' %s' \
             ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
+            ${cache_args[@]+"${cache_args[@]}"} \
+            "${build_args[@]}" \
+            -t "$image" -f "$dockerfile" .
+        printf '\n'
+        OK_LIST+=("$v")
+        continue
+    fi
+
+    echo "==> building ${image} from ${dockerfile} (platform=${PLATFORM:-native} ${build_args[*]})"
+    if docker buildx build --load \
+            ${PLATFORM_FLAG[@]+"${PLATFORM_FLAG[@]}"} \
+            ${cache_args[@]+"${cache_args[@]}"} \
             "${build_args[@]}" \
             -t "$image" \
             -f "$dockerfile" \
             .; then
         OK_LIST+=("$v")
     else
-        echo "build.sh: docker build failed for ${v}" >&2
+        echo "build.sh: docker buildx build failed for ${v}" >&2
         FAIL_LIST+=("$v")
     fi
 done

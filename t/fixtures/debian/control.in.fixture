@@ -1,0 +1,12 @@
+Source: libnginx-mod-http-zstd
+Section: httpd
+Priority: optional
+Maintainer: zstd-nginx-module CI <ci@zstd-nginx-module.local>
+Build-Depends: debhelper-compat (= 13), build-essential, libzstd-dev, nginx-dev
+Standards-Version: 4.6.0
+
+Package: libnginx-mod-http-zstd-filter
+Architecture: any
+Depends: nginx (>> @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
+Description: Zstandard compression filter module for nginx
+ On-the-fly Zstandard response compression filter.
