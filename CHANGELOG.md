@@ -7,6 +7,8 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-22
+
 ### Added
 
 - GitHub Actions CI/CD: 3-variant test matrix on PR/push to `stable`;
