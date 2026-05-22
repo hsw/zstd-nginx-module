@@ -111,6 +111,12 @@ RUN sed \
 
 EXPOSE 8080
 
+# Gate helper used by run-valgrind.sh (and the host-side t/valgrind.sh).
+# Lives at a stable path so the in-container script can find it without
+# depending on the host work tree layout.
+COPY t/check-valgrind-log.sh /usr/local/bin/check-valgrind-log.sh
+RUN chmod +x /usr/local/bin/check-valgrind-log.sh
+
 # Self-contained entrypoint for `docker compose up valgrind`: wraps nginx with
 # a valgrind shim, runs the pytest subset, collects logs into the mounted
 # /work/valgrind-logs volume, exits nonzero on real findings.

@@ -56,6 +56,7 @@ mkdir -p "$LOG_DIR"
 VAR_NAMES=()
 VAR_PASS=()
 VAR_FAIL=()
+VAR_SKIP=()
 # variant_index writes the (zero-based) row index for $1 into $VARIANT_IDX,
 # appending a new row if needed. We avoid command substitution to keep the
 # array mutations in the parent shell (bash 3.2 subshells can't write back).
@@ -70,6 +71,7 @@ variant_index() {
     VAR_NAMES+=("$v")
     VAR_PASS+=(0)
     VAR_FAIL+=(0)
+    VAR_SKIP+=(0)
     VARIANT_IDX=$((${#VAR_NAMES[@]} - 1))
 }
 
@@ -80,6 +82,10 @@ variant_inc_pass() {
 variant_inc_fail() {
     variant_index "$1"
     VAR_FAIL[$VARIANT_IDX]=$((${VAR_FAIL[$VARIANT_IDX]} + 1))
+}
+variant_inc_skip() {
+    variant_index "$1"
+    VAR_SKIP[$VARIANT_IDX]=$((${VAR_SKIP[$VARIANT_IDX]} + 1))
 }
 
 SUMMARY_LINES=()
@@ -241,6 +247,51 @@ run_variant() {
     docker stop "$cid" >/dev/null 2>&1 || true
 }
 
+# Host-side gate-semantics regression (codex4 P1.3a/b): runs in milliseconds,
+# no Docker required. Wired here so a green run.sh implies the release-gate
+# detectors are still well-defined. Failure is fatal — fix the gate before
+# trusting any per-variant results.
+echo "==> gate-semantics (host-side)"
+if bash "${REPO_ROOT}/t/test-gate-semantics.sh"; then
+    echo "  pass  gate-semantics"
+    variant_inc_pass "gate-semantics"
+    SUMMARY_LINES+=("gate-semantics: pass")
+else
+    rc=$?
+    echo "  fail  gate-semantics rc=${rc}"
+    variant_inc_fail "gate-semantics"
+    SUMMARY_LINES+=("gate-semantics: fail (rc=${rc})")
+fi
+
+# codex4 P1.2 regression: verify the explicit-path branch of filter/static
+# config files prefers shared libzstd over libzstd.a. Self-skips if the
+# ubuntu-24.04 image isn't built (e.g. running a subset that excludes it),
+# so safe to invoke unconditionally on every t/run.sh pass.
+echo "==> explicit-paths (host-side)"
+# Capture rc explicitly so we can distinguish 0/pass from 77/skip (autoconf
+# SKIP convention) from any other non-zero exit (fail). A bare `if bash ...`
+# would lump 77 in with 0 and report a falsely-green pass when docker / the
+# test image is absent.
+bash "${REPO_ROOT}/t/test-explicit-paths.sh"
+rc=$?
+case "$rc" in
+    0)
+        echo "  pass  explicit-paths"
+        variant_inc_pass "explicit-paths"
+        SUMMARY_LINES+=("explicit-paths: pass")
+        ;;
+    77)
+        echo "  skip  explicit-paths (docker/image absent)"
+        variant_inc_skip "explicit-paths"
+        SUMMARY_LINES+=("explicit-paths: skip (docker/image absent)")
+        ;;
+    *)
+        echo "  fail  explicit-paths rc=${rc}"
+        variant_inc_fail "explicit-paths"
+        SUMMARY_LINES+=("explicit-paths: fail (rc=${rc})")
+        ;;
+esac
+
 for v in "${VARIANTS[@]}"; do
     echo "==> ${v}"
     run_variant "$v"
@@ -258,8 +309,9 @@ i=0
 for v in ${VAR_NAMES[@]+"${VAR_NAMES[@]}"}; do
     p=${VAR_PASS[$i]}
     f=${VAR_FAIL[$i]}
+    s=${VAR_SKIP[$i]}
     TOTAL_FAIL=$((TOTAL_FAIL + f))
-    printf '  %-32s pass=%d fail=%d\n' "$v" "$p" "$f"
+    printf '  %-32s pass=%d fail=%d skip=%d\n' "$v" "$p" "$f" "$s"
     i=$((i + 1))
 done
 

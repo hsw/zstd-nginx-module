@@ -1,0 +1,12 @@
+==88== Memcheck, a memory error detector
+==88== Copyright (C) 2002-2022, and GNU GPL'd, by Julian Seward et al.
+==88== Using Valgrind-3.22.0 and LibVEX; rerun with -h for copyright info
+==88== Command: /usr/sbin/nginx.real -c /etc/nginx/nginx.conf
+==88== Parent PID: 12
+==88==
+==88== Invalid read of size 4
+==88==    at 0x4843E40: ngx_http_zstd_filter_body (ngx_http_zstd_filter_module.c:512)
+==88==    by 0x4843F12: ngx_http_output_filter (ngx_http_output_filter.c:13)
+==88==
+==88== Invalid write of size 8
+==88==    at 0x4843E50: ngx_http_zstd_filter_body (ngx_http_zstd_filter_module.c:520)

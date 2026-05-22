@@ -47,6 +47,24 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Fixed
 
+- `ngx_http_zstd_static_module` `zstd_static` directive enum table was
+  missing the `{ ngx_null_string, 0 }` terminator. nginx's
+  `ngx_conf_set_enum_slot()` iterates until it sees a zero-length name; on
+  an invalid token (e.g. `zstd_static bad;`) the loop ran past the array
+  end into adjacent rodata, an OOB read with undefined behaviour per the
+  nginx module ABI contract. nginx core `gzip_static` has the sentinel;
+  we now match. The current image happens to surface a clean `invalid
+  value "bad"` emerg, but the underlying read was unsafe. (codex4 P1.1.)
+- `filter/config` and `static/config` explicit-path branch
+  (`$ZSTD_INC` / `$ZSTD_LIB` set) previously tried `$ZSTD_LIB/libzstd.a`
+  first regardless of `ngx_module_link`. For `--add-dynamic-module`
+  builds against a distro libzstd this could re-introduce the
+  non-PIC-archive link failure that the auto-discovery branch already
+  guards against. The explicit-path branch now branches on
+  `ngx_module_link = DYNAMIC` and prefers `-L$ZSTD_LIB -lzstd
+  -Wl,-rpath,$ZSTD_LIB` for dynamic builds, falling back to the
+  archive-first / shared-fallback two-step for static `--add-module`
+  builds. Mirrors the auto-discovery branch behaviour. (codex4 P1.2.)
 - `ngx_http_zstd_static_module` no longer poisons downstream gzip when the
   `.zst` sidecar is absent. `ngx_http_zstd_ok()` previously set
   `r->gzip_tested = 1; r->gzip_ok = 0;` before probing the file; on
@@ -99,6 +117,42 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ### Testing
 
+- Valgrind release gate no longer reports fully-suppressed summaries
+  as failures. The prior per-log regex matched any `ERROR SUMMARY:
+  [1-9]` and flagged real-world logs whose only errors were suppressed
+  by `valgrind.suppress`. The check now parses
+  `ERROR SUMMARY: N errors from M contexts (suppressed: K)` and only
+  fails when `N - K > 0`, plus a positive `definitely lost:` byte count.
+  Shared helper extracted to `t/check-valgrind-log.sh` for DRY +
+  testability between `t/valgrind.sh` and `t/docker/run-valgrind.sh`.
+  (codex4 P1.3a.)
+- SAST release gate no longer masks analyzer exit codes with blanket
+  `|| true`. The five analyzer invocations in `t/docker/run-sast.sh`
+  (`scan-build`, `clang-tidy`, `cppcheck`, `gcc -fanalyzer`,
+  `flawfinder`) now propagate their exit codes into `overall_rc`,
+  captured via `${PIPESTATUS[0]}` for `tee` chains. Policy split:
+  `scan-build` remains **advisory** pending triage of its current 46
+  findings; the other four are **blocking**. `|| true` retained only
+  on housekeeping `make clean`. Static-grep regression assertions in
+  `t/test-gate-semantics.sh` catch any future `|| true` re-introduction
+  on a blocking analyzer line in milliseconds. (codex4 P1.3b.)
+- New `t/regression/test_codex4_enum_sentinel.py` covers `zstd_static`
+  enum parsing: off/on/always parametrized happy paths plus two
+  invalid-token rejection cases (`zstd_static bad;` and
+  `zstd_static maybe;`).
+- New `t/test-explicit-paths.sh` end-to-end harness for the codex4 P1.2
+  fix: builds the dynamic module with explicit `ZSTD_INC` / `ZSTD_LIB`
+  set against the `ubuntu-24.04` image, asserts the link line uses
+  `-L<lib> -lzstd -Wl,-rpath,<lib>`, and runs `nginx -t` against the
+  loaded `.so`. Skipped automatically if the image is absent.
+- New `t/test-gate-semantics.sh` + `t/check-valgrind-log.sh` exercise
+  the Valgrind gate against seven canned fixtures covering the
+  classification axes: clean-pass (`suppressed-only.log`), real-leak
+  (`real-leak.log`, `comma-leak.log`), error-only (`error-no-leak.log`,
+  `mixed.log`), suppressed-error + leak (`suppressed-error-with-leak.log`),
+  and malformed input (`truncated.log`). Plus the SAST static-grep
+  assertions on `t/docker/run-sast.sh`. Locks in the gate-semantics
+  contract without requiring a full Docker/analyzer setup.
 - New parallel matrix runner: `t/matrix-parallel.sh` + `t/docker/docker-bake.hcl`
   build and run the default 6-variant regression matrix concurrently
   instead of the sequential `t/build.sh` + `t/run.sh` driver pair.

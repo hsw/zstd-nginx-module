@@ -65,17 +65,44 @@ done
 
 # Findings:
 #   * "definitely lost: [1-9]" → real leak
-#   * "ERROR SUMMARY: [1-9]"   → memcheck error (Invalid read/write, uninit, etc.)
-# Indirectly-lost reports without these are typically chained off a suppressed
-# nginx-core init pool, so we don't flag them on their own.
+#   * "ERROR SUMMARY: N errors from M contexts (suppressed: K)" with
+#     N - K > 0  → real memcheck error (Invalid read/write, uninit, etc.)
+# Fully-suppressed summaries (N == K, e.g. "1 errors ... (suppressed: 1)")
+# are noise we accept. Indirectly-lost reports without the above are
+# typically chained off a suppressed nginx-core init pool.
+#
+# Classification lives in t/check-valgrind-log.sh so the gate semantics are
+# unit-tested via t/test-gate-semantics.sh and shared with the host-side
+# driver (t/valgrind.sh).
 echo
 echo "=== valgrind findings ==="
 found_real=0
+# Gate helper is baked into the image at a stable path by Dockerfile.valgrind.
+# If it's missing the image build was incomplete — fail loud, don't silently
+# fall back to an inline detector that can drift from the canonical helper.
+GATE=/usr/local/bin/check-valgrind-log.sh
+if [ ! -x "$GATE" ]; then
+    echo "FATAL: gate helper missing at $GATE — rebuild the valgrind image" >&2
+    exit 2
+fi
+
+# Fail closed if zero per-PID logs were collected — that means valgrind never
+# actually ran (pytest skipped, nginx wrapper broken, log copy failed, etc.).
+# Without this guard the loop below sees no files and reports
+# "no leaks beyond suppressions", silently turning the gate green.
+shopt -s nullglob
+_vg_logs=("${LOG_DIR}/raw"/*.log)
+shopt -u nullglob
+if [ "${#_vg_logs[@]}" -eq 0 ]; then
+    echo "ERROR: valgrind gate found zero per-PID logs in ${LOG_DIR}/raw/ — Memcheck never ran" >&2
+    exit 1
+fi
+
 for f in "${LOG_DIR}/raw"/*.log; do
     [ -f "$f" ] || continue
-    if grep -E 'definitely lost: [1-9]' "$f" >/dev/null 2>&1 \
-       || grep -E 'ERROR SUMMARY: [1-9]' "$f" >/dev/null 2>&1; then
+    if ! gate_out="$("$GATE" "$f" 2>&1)"; then
         echo "--- $(basename "$f") ---"
+        printf '%s\n' "$gate_out"
         grep -E 'definitely lost:|indirectly lost:|possibly lost:|still reachable:|ERROR SUMMARY:|Invalid (read|write)|Conditional jump|Use of uninitialised' "$f" | head -12
         found_real=1
     fi

@@ -73,7 +73,7 @@ server {
 To use theses modules, configure your nginx branch with `--add-module=/path/to/zstd-nginx-module`. Several points should be taken care of.
 
 * You can set environment variables `ZSTD_INC` and `ZSTD_LIB` to specify the path to `zstd.h` and the path to zstd shared library respectively.
-* auto-discovery prefers the **shared** libzstd (required for `--add-dynamic-module`, since static archives are usually not built with `-fPIC`). A static archive (`libzstd.a`) is tried as a fallback only for static `--add-module` builds. When `ZSTD_INC`/`ZSTD_LIB` are set, the explicit static archive at `$ZSTD_LIB/libzstd.a` is tried first, then the shared library. The module includes `zstd.h` with `ZSTD_STATIC_LINKING_ONLY` to expose experimental APIs (header visibility only — not a link mode).
+* auto-discovery prefers the **shared** libzstd (required for `--add-dynamic-module`, since static archives are usually not built with `-fPIC`). A static archive (`libzstd.a`) is tried as a fallback only for static `--add-module` builds. When `ZSTD_INC`/`ZSTD_LIB` are set explicitly, the branch depends on build mode: static `--add-module` builds try `$ZSTD_LIB/libzstd.a` first then fall back to the shared library, whereas `--add-dynamic-module` builds skip the archive entirely and link the shared library (so the resulting `.so` does not pull in non-PIC `.a` objects and break with `R_X86_64_PC32` relocation errors). The module includes `zstd.h` with `ZSTD_STATIC_LINKING_ONLY` to expose experimental APIs (header visibility only — not a link mode).
 * System's zstd bundle will be linked if `ZSTD_INC` and `ZSTD_LIB` are not specified.
 * Both `ngx_http_zstd_static_module` and `ngx_http_zstd_filter_module` will be configured.
 
