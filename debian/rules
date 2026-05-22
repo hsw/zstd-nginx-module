@@ -19,7 +19,8 @@
 #   ZSTD_LIB   — additional -L path for libzstd library (consumed via $(if ...) below).
 #                (default: empty; uses /usr/lib via libzstd-dev)
 #   NGINX_SRC  — path to unpacked nginx source tree (consumed via `?=` default below).
-#                (default: /usr/src/nginx-source/, populated by nginx-dev)
+#                (default: /usr/local/src/nginx, the symlink set by
+#                t/ci/install-nginx-mainline.sh to /usr/local/src/nginx-${VER}/)
 
 # Honour ZSTD_INC / ZSTD_LIB env overrides for cc-opt / ld-opt. Both vars
 # are empty in the default libzstd-dev path (CI uses /usr/include + /usr/lib)
@@ -30,7 +31,7 @@
 ZSTD_CC_OPT := $(if $(ZSTD_INC),--with-cc-opt=-I$(ZSTD_INC),)
 ZSTD_LD_OPT := $(if $(ZSTD_LIB),--with-ld-opt=-L$(ZSTD_LIB),)
 
-NGINX_SRC ?= /usr/src/nginx-source/
+NGINX_SRC ?= /usr/local/src/nginx
 
 # Module subdirectories within this source tree.
 MODULE_FILTER := $(CURDIR)/filter
@@ -48,11 +49,13 @@ override_dh_auto_configure:
 	    --add-dynamic-module=$(MODULE_STATIC)
 
 override_dh_auto_build:
-	# Builds modules into $(NGINX_SRC)/objs/. nginx-dev's source tree at
-	# /usr/src/nginx-source/ is writable by root (the CI build user), so
-	# this works without an explicit copy. If that ever changes upstream,
-	# either copy $(NGINX_SRC) to a private build dir here, or override
-	# NGINX_SRC env from the caller.
+	# Builds modules into $(NGINX_SRC)/objs/. The nginx source tarball is
+	# unpacked into /usr/local/src/nginx-${VER}/ by
+	# t/ci/install-nginx-mainline.sh as root (the CI build user), so this
+	# works without an explicit copy. If that ever changes (e.g. building
+	# under a non-root user that can't write under /usr/local/src), either
+	# copy $(NGINX_SRC) to a private build dir here, or override NGINX_SRC
+	# env from the caller.
 	$(MAKE) -C $(NGINX_SRC) modules
 
 override_dh_auto_install:

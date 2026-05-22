@@ -94,11 +94,52 @@ assert_grep_present "$RULES" \
     "debian/rules configure includes --add-dynamic-module=...static"
 
 # Build-Depends must include libzstd-dev — the filter module links libzstd.
-# nginx-dev provides the configure hooks; debhelper-compat is the dh
-# sequencer version pin. libzstd-dev is OUR addition over pkg-oss default.
+# debhelper-compat is the dh sequencer version pin. libzstd-dev is OUR
+# addition over pkg-oss default.
 assert_grep_present "$CONTROL_IN" \
     'Build-Depends:.*libzstd-dev' \
     "debian/control.in Build-Depends contains libzstd-dev"
+
+# Build-Depends must NOT reference nginx-dev. Ubuntu's nginx-dev depends on
+# Ubuntu's distro nginx (~1.24), which conflicts with the nginx.org mainline
+# `nginx` package the CI build job installs. Instead, the build pulls the
+# matching nginx source tarball into /usr/local/src/nginx/ and compiles
+# against that — so nginx-dev is neither needed nor desired here. This
+# assertion guards against a future re-scaffold from pkg-oss accidentally
+# re-introducing the nginx-dev build-dep.
+assert_grep_absent() {
+    local file="$1"
+    local pattern="$2"
+    local label="$3"
+    if [ ! -f "$file" ]; then
+        printf '  FAIL  %s — file missing: %s\n' "$label" "$file"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    if grep -qE -e "$pattern" "$file"; then
+        printf '  FAIL  %s — pattern unexpectedly present: %s\n' "$label" "$pattern"
+        fail_count=$((fail_count + 1))
+    else
+        printf '  PASS  %s\n' "$label"
+        pass_count=$((pass_count + 1))
+    fi
+}
+assert_grep_absent "$CONTROL_IN" \
+    'Build-Depends:.*nginx-dev' \
+    "debian/control.in Build-Depends does NOT reference nginx-dev"
+
+# nginx configure script needs PCRE, OpenSSL, and zlib headers even when
+# compiling --with-compat dynamic modules. Without these the dh_auto_configure
+# step in debian/rules fails before we get anywhere near our module sources.
+assert_grep_present "$CONTROL_IN" \
+    'Build-Depends:.*libpcre2-dev' \
+    "debian/control.in Build-Depends contains libpcre2-dev (nginx configure)"
+assert_grep_present "$CONTROL_IN" \
+    'Build-Depends:.*libssl-dev' \
+    "debian/control.in Build-Depends contains libssl-dev (nginx configure)"
+assert_grep_present "$CONTROL_IN" \
+    'Build-Depends:.*zlib1g-dev' \
+    "debian/control.in Build-Depends contains zlib1g-dev (nginx configure)"
 
 # ZSTD_INC / ZSTD_LIB env passthrough — operators must be able to override
 # the libzstd include/lib paths at build time without editing debian/rules

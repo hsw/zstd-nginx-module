@@ -2,7 +2,7 @@ Source: libnginx-mod-http-zstd
 Section: httpd
 Priority: optional
 Maintainer: zstd-nginx-module CI <ci@zstd-nginx-module.local>
-Build-Depends: debhelper-compat (= 13), build-essential, libzstd-dev, nginx-dev
+Build-Depends: debhelper-compat (= 13), build-essential, libpcre2-dev, libssl-dev, zlib1g-dev, libzstd-dev
 Standards-Version: 4.6.0
 Homepage: https://github.com/tokers/zstd-nginx-module
 Vcs-Browser: https://github.com/shomenkow/zstd-nginx-module

@@ -163,18 +163,24 @@ jobs:
         # - workflow_dispatch: operator-driven rebuild; pull both MODULE_VERSION
         #   (validated upstream in test-full) and DEB_REVISION from inputs so
         #   `0.3.0-2` etc. is expressible.
-        # NGINX_VERSION is read from the INSTALLED version of nginx-dev (the
-        # package the module is actually built against), NOT the apt Candidate.
-        # The Candidate reflects whatever the repo currently advertises, which
-        # diverges from Installed when workflow_dispatch pins an older
-        # `nginx_version` while the mainline repo has already moved on. Reading
-        # Candidate would produce an ABI pin (debian/control >> X.Y, << X.Y+1)
-        # that disagrees with the binary the module was compiled against — the
-        # exact silent-mismatch failure mode this workflow is designed to avoid.
+        # NGINX_VERSION is read from the INSTALLED version of the `nginx`
+        # package (the binary whose source tarball the module is built
+        # against), NOT the apt Candidate. The Candidate reflects whatever the
+        # repo currently advertises, which diverges from Installed when
+        # workflow_dispatch pins an older `nginx_version` while the mainline
+        # repo has already moved on. Reading Candidate would produce an ABI
+        # pin (debian/control >> X.Y, << X.Y+1) that disagrees with the binary
+        # the module was compiled against — the exact silent-mismatch failure
+        # mode this workflow is designed to avoid.
         # The `sed 's/-.*//'` strip drops the apt -<distro_revision> suffix
         # (e.g. `1.29.5-1~jammy` → `1.29.5`) so debian/prepare.sh receives a
-        # clean upstream version. dpkg-query exits non-zero if nginx-dev is
+        # clean upstream version. dpkg-query exits non-zero if nginx is
         # missing, which surfaces as a hard failure under set -e (correct).
+        # nginx-dev is intentionally NOT installed here: Ubuntu's nginx-dev
+        # depends on Ubuntu's distro nginx (~1.24), which conflicts with
+        # nginx.org mainline (1.29+). install-nginx-mainline.sh instead
+        # unpacks the matching source tarball at /usr/local/src/nginx/, and
+        # debian/rules builds the modules against that tree.
         # Operator inputs are passed via env (not ${{ }} into shell) to defeat
         # shell-injection via a hostile module_ref / deb_revision value.
         env:
@@ -188,7 +194,7 @@ jobs:
               MODULE_VERSION="${MODULE_REF#v}"
               DEB_REVISION="$DEB_REVISION_IN"
           fi
-          NGINX_VERSION=$(dpkg-query -W -f='${Version}' nginx-dev | sed 's/-.*//')
+          NGINX_VERSION=$(dpkg-query -W -f='${Version}' nginx | sed 's/-.*//')
           {
               echo "MODULE_VERSION=$MODULE_VERSION"
               echo "DEB_REVISION=$DEB_REVISION"
