@@ -18,6 +18,18 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 - `t/ci/install-nginx-mainline.sh` reusable nginx.org apt-repo bootstrap script.
 - Self-tests: `t/test-debian-prepare.sh`, `t/test-debian-rules.sh`,
   `t/test-build-cache-env.sh`.
+- `.github/dependabot.yml` enables weekly Dependabot updates for the
+  `github-actions` ecosystem so action versions stay current.
+
+### Changed
+
+- GitHub Actions references switched from SHA pins back to version tags
+  (`actions/checkout@v5`, `docker/setup-buildx-action@v4`,
+  `actions/upload-artifact@v4`, `actions/download-artifact@v4`,
+  `softprops/action-gh-release@v2`). Resolves the Node.js 20 deprecation
+  warning on `actions/checkout@v4` + `docker/setup-buildx-action@v3` (both
+  now Node 24). Dependabot keeps the tags current; supply-chain hardening
+  moves from manual SHA-pinning to automated PR-based bumps.
 - `ngx_http_zstd_static_module` now enables Range requests on `.zst`
   sidecars (sets `r->allow_ranges = 1` before `ngx_http_send_header`),
   matching nginx core `gzip_static`. Clients can now request byte ranges
