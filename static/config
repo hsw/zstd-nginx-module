@@ -1,7 +1,13 @@
 ngx_feature_incs="#include <zstd.h>"
 ngx_feature_test="(void) ZSTD_createCCtx();"
 ngx_feature_libs=
-ngx_feature_run=yes
+# Compile + link only, never execute the probe binary: the test merely calls
+# ZSTD_createCCtx(), so a successful link already proves libzstd is present —
+# there is no runtime value to capture. Running it breaks cross-compilation
+# (ARM64/RISC-V/s390x on an x86_64 host), where the host cannot execute the
+# target binary and configure would wrongly report libzstd absent.
+# Adapted from eilandert/zstd-nginx-module ae1ef75.
+ngx_feature_run=no
 
 ngx_zstd_opt_I=
 ngx_zstd_opt_L=
