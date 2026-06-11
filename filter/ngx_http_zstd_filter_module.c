@@ -290,7 +290,9 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
-    /* header_only early (gzip tests it last): skip type-hash lookup on HEAD */
+    /* header_only early (gzip tests it last): skip type-hash lookup
+     * when header_only is pre-set (subrequests, internal responses);
+     * plain HEAD is marked header_only later, by the core filter */
 
     if (!zlcf->enable
         || r->header_only
