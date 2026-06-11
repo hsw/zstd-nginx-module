@@ -7,6 +7,33 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ## [Unreleased]
 
+### Changed
+
+- A response with a known `Content-Length: 0` is no longer compressed,
+  regardless of `zstd_min_length` (including `zstd_min_length 0;`) — nothing
+  is gained by compressing an empty body, and the known-CL auto-window path
+  previously allocated a full baseline workspace for zero bytes (C12-2).
+  Responses of *unknown* length (chunked) that turn out empty still emit a
+  valid empty zstd frame by design, since `Content-Encoding` is committed at
+  header time (nginx gzip parity).
+
+### Fixed
+
+- Filter body loop now recycles consumed input chain links via
+  `ngx_free_chain` instead of dropping them, matching the nginx gzip and
+  ngx_brotli siblings — long streaming responses no longer accumulate dead
+  chain links in the request pool (N11-1).
+- Both modules now set `h->next = NULL` on the pushed `Content-Encoding`
+  header (guarded `#if nginx_version >= 1023000`, ngx_brotli parity) —
+  `ngx_list_push` returns uninitialized memory and nginx >= 1.23 walks known
+  headers via `ngx_table_elt_t.next` (N12-1, N15-1).
+- UB-class cleanups in the filter: `%uz` for `size_t` in the debug compress
+  traces (C06-1), `(ngx_int_t)` cast on `ZSTD_maxCLevel()` in the level-range
+  config error (C06-2), `buffer_out.size` computed from `pos` not `start`
+  (P12-1), and `$zstd_ratio` buffer sized for the 3-digit fraction (S01-1).
+  Plus a micro-reorder of the `header_only` decline ahead of the content-type
+  test (P02-1).
+
 ## [0.3.0] - 2026-05-22
 
 ### Added

@@ -188,10 +188,8 @@ def _send_chunked(c: socket.socket, size: int, key: str, body_factory) -> None:
 
 def _send_empty_cl(c: socket.socket) -> None:
     """200 OK with explicit `Content-Length: 0` and zero body bytes.
-    Exercises the auto-window path where the snapshotted
-    content_length_n is exactly 0 — must enter the auto-tune branch and
-    pick the minimum cParams (windowLog = ZSTD_WINDOWLOG_MIN = 10),
-    not silently fall back to the level-default workspace baseline."""
+    The header filter declines this outright (C12-2) — used to assert
+    the decline (no Content-Encoding, no auto-window log line)."""
     with GROUND_TRUTH_LOCK:
         GROUND_TRUTH["/empty-cl"] = b""
     c.sendall(
@@ -595,7 +593,7 @@ def test_auto_window_zero_content_length(upstream_fixture):
         body = r.raw.read(decode_content=False)
         r.close()
         assert r.status_code == 200, f"status={r.status_code}"
-        assert r.headers.get("Content-Encoding") not in ("zstd",), (
+        assert r.headers.get("Content-Encoding") != "zstd", (
             f"known Content-Length: 0 must be declined (C12-2), got "
             f"Content-Encoding={r.headers.get('Content-Encoding')!r}"
         )
@@ -606,14 +604,6 @@ def test_auto_window_zero_content_length(upstream_fixture):
             f"auto-window fired on a known Content-Length: 0 response; it "
             f"should have been declined in the header filter (C12-2) before "
             f"create_cstream. log tail:\n{log[-2000:]}"
-        )
-        assert "zstd workspace exhausted" not in log
-
-        # Decode the (empty) body to guard against a regression where the
-        # filter mishandles the empty stream and produces an invalid frame.
-        decoded = zstd_decompress(body)
-        assert decoded == b"", (
-            f"expected empty decoded body for cl=0, got {len(decoded)} bytes"
         )
     finally:
         stop_nginx()

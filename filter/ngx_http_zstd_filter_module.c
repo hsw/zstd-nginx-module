@@ -338,7 +338,9 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     }
 
     h->hash = 1;
+#if (nginx_version >= 1023000)
     h->next = NULL;
+#endif
     ngx_str_set(&h->key, "Content-Encoding");
     ngx_str_set(&h->value, "zstd");
     r->headers_out.content_encoding = h;
@@ -818,24 +820,13 @@ ngx_http_zstd_filter_create_cstream(ngx_http_request_t *r,
      * could grow per-request memory.
      *
      * Activates when EITHER:
-     *   (a) r->headers_out.content_length_n >= 1 — body size known and
-     *       non-zero, use it as the srcSize hint. (A known C-L == 0 is
-     *       declined upstream in the header filter regardless of
-     *       min_length — compressing an empty body only produces a
-     *       pointless empty zstd frame and a baseline-sized workspace —
-     *       so this branch never sees content_length_n == 0.) Note that
-     *       ZSTD_getCParams(level, srcSize, 0) treats srcSize == 0 as
-     *       UNKNOWN: across libzstd 1.4.0 -> current it returns the
-     *       level-default cParams (e.g. windowLog 19 at level 3), NOT a
-     *       minimum / clamped-to-ZSTD_WINDOWLOG_MIN window — which is the
-     *       very reason a known-empty response is declined rather than
-     *       fed through this path. HEAD requests + 204/304 never reach
-     *       here either (r->header_only early-skip at header filter +
-     *       filter declines body). Chunked / unknown-length empty
-     *       responses (content_length_n == -1) are a separate, by-design
-     *       case: Content-Encoding is committed at header time before any
-     *       body arrives, so an empty chunked response still emits a
-     *       valid (empty) zstd frame — gzip-parity, out of C12-2 scope;
+     *   (a) ctx->content_length_n >= 0 — body size known; used as the
+     *       srcSize hint. In practice always >= 1: a known C-L == 0 is
+     *       declined upstream in the header filter (C12-2), and
+     *       ZSTD_getCParams(level, 0, 0) would treat srcSize == 0 as
+     *       UNKNOWN (level-default cParams, e.g. windowLog 19 — not a
+     *       WINDOWLOG_MIN clamp) anyway. Chunked-empty behaviour is
+     *       documented in t/regression/test_empty_body.py;
      *   (b) zlcf->window_bits != NGX_CONF_UNSET — operator wants the
      *       cap to apply regardless of transfer encoding (e.g.
      *       Chrome-compat windowLog<=23 for chunked responses too).

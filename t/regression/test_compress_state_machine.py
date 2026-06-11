@@ -9,7 +9,6 @@ branches — coverage is now black-box (request → response → decompress
 → compare to ground truth) rather than whitebox.
 
 Each parametrized case exercises a distinct entry shape:
-  * empty            — last_buf=1 on zero-byte buffer_in (sentinel-buf path)
   * single-byte      — minimal terminate-immediately path
   * h1-131072        — HTTP/1.1 counterpart to h2-truncation (chain-link
                        boundary at ZSTD_CStreamInSize())
@@ -24,7 +23,9 @@ Plus two non-parametrized tests:
 
 Coverage scope: byte-equality + valid framing across all entry shapes.
 The production flush-promotion latency bug is exercised by
-`test_proxy_flush.py` (chunked-off-tiny sub-test).
+`test_proxy_flush.py` (chunked-off-tiny sub-test). Empty-body contracts
+(known CL=0 declined per C12-2; chunked-empty sentinel-buf path) live in
+`test_empty_body.py`.
 """
 
 from __future__ import annotations
@@ -48,12 +49,6 @@ from conftest import (
 
 
 EXTRA_LOCATIONS = """
-    # Empty 200 — last_buf=1 with zero-byte buffer_in. Forces sentinel-buf
-    # allocation in the filter (out_buf size==0 after endStream).
-    location = /empty {
-        add_header Content-Type text/plain;
-        return 200 "";
-    }
     # Single-byte body — minimal viable input.
     location = /single {
         add_header Content-Type text/plain;
@@ -123,7 +118,6 @@ def _decompress(body: bytes, tmp_path: Path, label: str) -> bytes:
 
 
 BASIC_CASES = [
-    BasicCase("empty", "/empty", b""),
     BasicCase("single", "/single", b"a"),
     BasicCase("h1-131072", "/random/131072",
               Path("/var/fixtures/random/131072")),
@@ -143,19 +137,6 @@ def test_state_machine_basic(nginx_state_machine, case: BasicCase, tmp_path):
     assert r.status_code == 200, (
         f"[{case.label}] status={r.status_code}, headers={dict(r.headers)}"
     )
-
-    # Empty body case: `return 200 ""` yields a known Content-Length: 0, which
-    # the header filter now declines (C12-2) — compressing zero bytes only
-    # emits a pointless empty zstd frame. Must be plain, empty, no encoding.
-    # (Chunked/unknown-length empty responses remain compressed by design —
-    # see test_empty_body.py for the known-CL contract.)
-    if case.label == "empty":
-        assert r.headers.get("Content-Encoding") not in ("zstd",), (
-            f"[empty] known Content-Length: 0 must not be zstd-encoded, got "
-            f"Content-Encoding={r.headers.get('Content-Encoding')!r}"
-        )
-        assert body == b"", f"[empty] body must stay empty, got {len(body)} bytes"
-        return
 
     assert r.headers.get("Content-Encoding") == "zstd", (
         f"[{case.label}] Content-Encoding={r.headers.get('Content-Encoding')!r}, "

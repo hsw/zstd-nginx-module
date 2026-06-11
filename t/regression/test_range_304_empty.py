@@ -6,8 +6,9 @@ Coverage for three rarely-exercised filter gates:
     map to encoded bytes).
   * 304 Not Modified short-circuit — conditional GET must not emit
     Content-Encoding and must not send a body.
-  * Empty body (204 / explicit return 200 "") — body filter sees last_buf
-    with bytes_in=0; must not crash, must not emit Content-Encoding.
+  * Empty body (204 / explicit return 200 "") — known Content-Length: 0,
+    declined in the header filter (C12-2); must not crash, must not emit
+    Content-Encoding.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from pathlib import Path
 import pytest
 
 from conftest import (
-    zstd_decompress,
     BASE_URL,
     _nginx_has_compat,
     http_request,
@@ -126,18 +126,14 @@ def test_empty_204_no_encoding(range_nginx):
 
 
 def test_empty_200_no_crash(range_nginx):
-    """200 with empty body: zero-byte body filter path. Most likely path to
-    trigger UB in the compress loop (last_buf=1 with bytes_in=0). The check
-    is nginx doesn't crash; if it does emit Content-Encoding the decompressed
-    body must still be empty."""
+    """200 with empty body (`return 200 ""` -> known Content-Length: 0):
+    the header filter declines compression outright (C12-2), so the strict
+    contract is no Content-Encoding and an empty plain body. The chunked
+    (unknown-length) empty counterpart lives in test_empty_body.py."""
     r, body = http_request(range_nginx, "/empty-200", accept_encoding="zstd")
     assert r.status_code == 200, f"status={r.status_code}"
-
-    ce = r.headers.get("Content-Encoding")
-    if ce == "zstd":
-        # encoded empty body must decompress to empty
-        import zstandard
-        dec = zstd_decompress(body)
-        assert dec == b"", f"zstd-encoded empty body decoded to {len(dec)} bytes"
-    else:
-        assert body == b"", f"plain empty-200 must have empty body, got {len(body)}"
+    assert r.headers.get("Content-Encoding") in (None, ""), (
+        f"known Content-Length: 0 must not set Content-Encoding (C12-2), got "
+        f"{r.headers.get('Content-Encoding')!r}"
+    )
+    assert body == b"", f"plain empty-200 must have empty body, got {len(body)}"

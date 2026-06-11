@@ -129,6 +129,14 @@ those responses).
 
 Sets the minimum length of a response that will be compressed by zstd. The length is determined only from the `Content-Length` response header field.
 
+A response with a known `Content-Length` of `0` is never compressed, regardless
+of this setting (including `zstd_min_length 0;`) — compressing an empty body
+only produces a pointless empty zstd frame. Responses of *unknown* length
+(e.g. chunked) are not subject to this directive; an unknown-length response
+that turns out to be empty still produces a valid empty zstd frame, because
+`Content-Encoding` is committed before any body bytes arrive (same behaviour
+as nginx gzip).
+
 ### zstd_window_bits
 
 **Syntax:** *zstd_window_bits N;*  
