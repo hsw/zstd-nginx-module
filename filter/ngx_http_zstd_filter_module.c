@@ -669,6 +669,8 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 static ngx_int_t
 ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 {
+    ngx_chain_t  *cl;
+
     /*
      * Sticky-flag head-of-line: while ctx->last or ctx->flush is set we
      * have an in-flight finish op (ZSTD_e_end / ZSTD_e_flush) that has
@@ -690,8 +692,10 @@ ngx_http_zstd_filter_add_data(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
         return NGX_DECLINED;
     }
 
-    ctx->in_buf = ctx->in->buf;
-    ctx->in = ctx->in->next;
+    cl = ctx->in;
+    ctx->in_buf = cl->buf;
+    ctx->in = cl->next;
+    ngx_free_chain(r->pool, cl);
 
     /*
      * Drop empty non-control bufs (brotli pattern, lines 478-487). An
