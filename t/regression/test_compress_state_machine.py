@@ -84,7 +84,7 @@ def _prepare_fixtures() -> Path:
 
 @pytest.fixture(scope="module")
 def nginx_state_machine() -> Iterator[str]:
-    """Module-scoped nginx with empty/single/equiv-proxy locations + the
+    """Module-scoped nginx with single/equiv-proxy locations + the
     /random/ alias from the baseline template."""
     _prepare_fixtures()
     stop_nginx()
@@ -100,9 +100,8 @@ def nginx_state_machine() -> Iterator[str]:
 class BasicCase:
     label: str
     path: str
-    # None → expect HTTP body to decompress to empty bytes; bytes → exact
-    # match; Path → byte-compare against file.
-    expect: bytes | Path | None
+    # bytes → exact match; Path → byte-compare against file.
+    expect: bytes | Path
 
 
 def _decompress(body: bytes, tmp_path: Path, label: str) -> bytes:
@@ -149,7 +148,7 @@ def test_state_machine_basic(nginx_state_machine, case: BasicCase, tmp_path):
     if isinstance(case.expect, Path):
         expect_bytes = case.expect.read_bytes()
     else:
-        expect_bytes = case.expect or b""
+        expect_bytes = case.expect
     assert decoded == expect_bytes, (
         f"[{case.label}] decoded differs: expected {len(expect_bytes)}B "
         f"got {len(decoded)}B"

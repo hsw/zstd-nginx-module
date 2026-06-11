@@ -19,6 +19,8 @@ be a malformed `Content-Encoding: zstd` body. This matches nginx gzip
 (empty chunked -> empty gzip stream) and is out of C12-2 scope by design.
 """
 
+from __future__ import annotations
+
 import socket
 import threading
 from pathlib import Path

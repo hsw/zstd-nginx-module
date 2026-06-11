@@ -290,17 +290,19 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
 
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
+    /* header_only early (gzip tests it last): skip type-hash lookup on HEAD */
+
     if (!zlcf->enable
         || r->header_only
         || (r->headers_out.status != NGX_HTTP_OK
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
             && r->headers_out.status != NGX_HTTP_NOT_FOUND)
-       || (r->headers_out.content_encoding
-           && r->headers_out.content_encoding->value.len)
-       || r->headers_out.content_length_n == 0
-       || (r->headers_out.content_length_n != -1
-           && r->headers_out.content_length_n < zlcf->min_length)
-       || ngx_http_test_content_type(r, &zlcf->types) == NULL)
+        || (r->headers_out.content_encoding
+            && r->headers_out.content_encoding->value.len)
+        || r->headers_out.content_length_n == 0
+        || (r->headers_out.content_length_n != -1
+            && r->headers_out.content_length_n < zlcf->min_length)
+        || ngx_http_test_content_type(r, &zlcf->types) == NULL)
     {
         return ngx_http_next_header_filter(r);
     }
@@ -509,7 +511,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     }
 
     ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "zstd compress in: src:%p pos:%uz size: %uz, "
+                   "zstd compress in: src:%p pos:%uz size:%uz, "
                    "dst:%p pos:%uz size:%uz flush:%d last:%d",
                    ctx->buffer_in.src, ctx->buffer_in.pos, ctx->buffer_in.size,
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
@@ -532,7 +534,7 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     }
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "zstd compress out: src:%p pos:%uz size: %uz, "
+                   "zstd compress out: src:%p pos:%uz size:%uz, "
                    "dst:%p pos:%uz size:%uz",
                    ctx->buffer_in.src, ctx->buffer_in.pos, ctx->buffer_in.size,
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
@@ -1697,7 +1699,7 @@ ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN + 5);
+    vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN + 4);
     if (vv->data == NULL) {
         return NGX_ERROR;
     }
