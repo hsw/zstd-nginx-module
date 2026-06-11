@@ -291,6 +291,7 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
     zlcf = ngx_http_get_module_loc_conf(r, ngx_http_zstd_filter_module);
 
     if (!zlcf->enable
+        || r->header_only
         || (r->headers_out.status != NGX_HTTP_OK
             && r->headers_out.status != NGX_HTTP_FORBIDDEN
             && r->headers_out.status != NGX_HTTP_NOT_FOUND)
@@ -298,8 +299,7 @@ ngx_http_zstd_header_filter(ngx_http_request_t *r)
            && r->headers_out.content_encoding->value.len)
        || (r->headers_out.content_length_n != -1
            && r->headers_out.content_length_n < zlcf->min_length)
-       || ngx_http_test_content_type(r, &zlcf->types) == NULL
-       || r->header_only)
+       || ngx_http_test_content_type(r, &zlcf->types) == NULL)
     {
         return ngx_http_next_header_filter(r);
     }
@@ -506,8 +506,8 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     }
 
     ngx_log_debug8(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "zstd compress in: src:%p pos:%ud size: %ud, "
-                   "dst:%p pos:%ud size:%ud flush:%d last:%d",
+                   "zstd compress in: src:%p pos:%uz size: %uz, "
+                   "dst:%p pos:%uz size:%uz flush:%d last:%d",
                    ctx->buffer_in.src, ctx->buffer_in.pos, ctx->buffer_in.size,
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
                    ctx->buffer_out.size, ctx->flush, ctx->last);
@@ -529,8 +529,8 @@ ngx_http_zstd_filter_compress(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
     }
 
     ngx_log_debug6(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "zstd compress out: src:%p pos:%ud size: %ud, "
-                   "dst:%p pos:%ud size:%ud",
+                   "zstd compress out: src:%p pos:%uz size: %uz, "
+                   "dst:%p pos:%uz size:%uz",
                    ctx->buffer_in.src, ctx->buffer_in.pos, ctx->buffer_in.size,
                    ctx->buffer_out.dst, ctx->buffer_out.pos,
                    ctx->buffer_out.size);
@@ -773,7 +773,7 @@ ngx_http_zstd_filter_get_buf(ngx_http_request_t *r, ngx_http_zstd_ctx_t *ctx)
 
     ctx->buffer_out.dst = ctx->out_buf->pos;
     ctx->buffer_out.pos = 0;
-    ctx->buffer_out.size = ctx->out_buf->end - ctx->out_buf->start;
+    ctx->buffer_out.size = ctx->out_buf->end - ctx->out_buf->pos;
 
     return NGX_OK;
 }
@@ -1695,7 +1695,7 @@ ngx_http_zstd_ratio_variable(ngx_http_request_t *r,
         return NGX_OK;
     }
 
-    vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN + 3);
+    vv->data = ngx_pnalloc(r->pool, NGX_INT_T_LEN + 5);
     if (vv->data == NULL) {
         return NGX_ERROR;
     }
@@ -1798,7 +1798,7 @@ ngx_http_zstd_comp_level(ngx_conf_t *cf, void *post, void *data)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "zstd compress level must between %i and %i "
                            "excluding 0",
-                           min_level, ZSTD_maxCLevel());
+                           min_level, (ngx_int_t) ZSTD_maxCLevel());
 
         return NGX_CONF_ERROR;
     }
