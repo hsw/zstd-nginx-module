@@ -143,13 +143,24 @@ def test_state_machine_basic(nginx_state_machine, case: BasicCase, tmp_path):
     assert r.status_code == 200, (
         f"[{case.label}] status={r.status_code}, headers={dict(r.headers)}"
     )
+
+    # Empty body case: `return 200 ""` yields a known Content-Length: 0, which
+    # the header filter now declines (C12-2) — compressing zero bytes only
+    # emits a pointless empty zstd frame. Must be plain, empty, no encoding.
+    # (Chunked/unknown-length empty responses remain compressed by design —
+    # see test_empty_body.py for the known-CL contract.)
+    if case.label == "empty":
+        assert r.headers.get("Content-Encoding") not in ("zstd",), (
+            f"[empty] known Content-Length: 0 must not be zstd-encoded, got "
+            f"Content-Encoding={r.headers.get('Content-Encoding')!r}"
+        )
+        assert body == b"", f"[empty] body must stay empty, got {len(body)} bytes"
+        return
+
     assert r.headers.get("Content-Encoding") == "zstd", (
         f"[{case.label}] Content-Encoding={r.headers.get('Content-Encoding')!r}, "
         f"expected zstd"
     )
-    # Empty body case: a zero-byte 200 still emits a valid zstd frame
-    # (just header + footer). It must NOT be a literal empty body — that
-    # would mean the filter skipped compression entirely.
     assert body[:4] == b"\x28\xb5\x2f\xfd", (
         f"[{case.label}] body missing zstd magic; hex={body[:16].hex()}"
     )

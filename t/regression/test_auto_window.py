@@ -559,25 +559,29 @@ def test_auto_window_below_floor_body_clamps_to_min(upstream_fixture):
 
 
 def test_auto_window_zero_content_length(upstream_fixture):
-    """`Content-Length: 0` 200 OK must ENTER the auto-tune predicate
-    (cl >= 0) rather than fall into the chunked-skip branch. Guards
-    against the prior `> 0` predicate that excluded C-L=0 from auto-tune.
+    """`Content-Length: 0` 200 OK is DECLINED by the header filter (C12-2),
+    so it never reaches the body filter's auto-tune path at all.
 
-    Observable signature on cl=0:
-      * the auto-window log line is emitted with `cl=0` (proves the
-        predicate fired);
-      * the SKIPPED line `(no content_length_n, no cap)` is ABSENT.
+    Compressing a known-empty body only emits a pointless empty zstd frame
+    and (on the auto-window path) allocates a full baseline workspace for
+    zero bytes, so the header filter now declines `content_length_n == 0`
+    regardless of min_length. The observable signature is therefore:
+      * the response carries NO `Content-Encoding: zstd` and an empty body;
+      * NO auto-window line is emitted for cl=0 — create_cstream is never
+        entered because the request was declined before the body filter
+        (mirrors the HEAD-parity early-return).
 
-    Empirical wlog note: libzstd's ZSTD_getCParams_internal special-cases
-    srcSize==0 by reassigning it to ZSTD_CONTENTSIZE_UNKNOWN
-    (tmp/src/zstd/lib/compress/zstd_compress.c:1633), so cl=0 yields
-    level-default cParams (wlog=19 at level=6) rather than the
-    WINDOWLOG_MIN clamp. We therefore do not assert an exact wlog —
-    behavior parity with the chunked path is fine; what matters is that
-    the auto-tune branch was entered (so future libzstd versions that
-    DO return smaller cParams for srcSize=0 will be picked up
-    automatically). The estimated workspace stays at-or-below baseline
-    and the request completes without `zstd workspace exhausted`.
+    Empirical wlog note (now only of historical interest, since this path is
+    declined): libzstd's ZSTD_getCParams_internal special-cases srcSize==0 by
+    reassigning it to ZSTD_CONTENTSIZE_UNKNOWN
+    (tmp/src/zstd/lib/compress/zstd_compress.c:1633), so cl=0 would yield
+    level-default cParams (wlog=19 at level=6), NOT a WINDOWLOG_MIN clamp —
+    which is precisely why a known-empty response is declined rather than fed
+    through auto-tune.
+
+    Chunked / unknown-length empty responses (content_length_n == -1) are out
+    of scope and remain compressed by design — see test_auto_window_chunked_*
+    and test_empty_body.py.
     """
     stop_nginx()
     _start_nginx_with_log()
@@ -591,19 +595,17 @@ def test_auto_window_zero_content_length(upstream_fixture):
         body = r.raw.read(decode_content=False)
         r.close()
         assert r.status_code == 200, f"status={r.status_code}"
+        assert r.headers.get("Content-Encoding") not in ("zstd",), (
+            f"known Content-Length: 0 must be declined (C12-2), got "
+            f"Content-Encoding={r.headers.get('Content-Encoding')!r}"
+        )
+        assert body == b"", f"empty body must stay empty, got {len(body)} bytes"
 
-        log = _wait_for_log(
-            lambda s: _find_auto_window_line(s, cl_match=0) is not None
-        )
-        m = _find_auto_window_line(log, cl_match=0)
-        assert m is not None, (
-            f"missing auto-window line for cl=0; the `>= 0` predicate "
-            f"regression would put this request in the skip branch. "
-            f"log tail:\n{log[-2000:]}"
-        )
-        assert SKIPPED_RE.search(log) is None, (
-            f"auto-window should not have skipped on cl=0; log tail:\n"
-            f"{log[-2000:]}"
+        log = _wait_for_log()
+        assert _find_auto_window_line(log, cl_match=0) is None, (
+            f"auto-window fired on a known Content-Length: 0 response; it "
+            f"should have been declined in the header filter (C12-2) before "
+            f"create_cstream. log tail:\n{log[-2000:]}"
         )
         assert "zstd workspace exhausted" not in log
 
