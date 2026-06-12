@@ -75,7 +75,12 @@ docker run --rm \
     -e ZSTD_LIB="$ZSTD_LIB_DIR" \
     "$IMAGE" bash -c '
         set -euo pipefail
-        cp -a /usr/local/src/nginx /tmp/nginx-build
+        # /usr/local/src/nginx is a SYMLINK to the versioned tree whose objs/
+        # already holds image-build-time .so artifacts; cp -aL dereferences
+        # into a real copy and rm -rf objs guarantees the assertions below
+        # can only pass against artifacts built HERE, not stale baked ones.
+        cp -aL /usr/local/src/nginx /tmp/nginx-build
+        rm -rf /tmp/nginx-build/objs
         cd /tmp/nginx-build
         # Reuse the same flags the image build used: --with-compat
         # --add-dynamic-module=<repo>. /src-current is the live host

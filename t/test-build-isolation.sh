@@ -93,13 +93,25 @@ run_case() {
     fi
 }
 
-# Shared in-container preamble: fresh copy of the baked nginx source tree
+# Shared in-container preamble: pristine copy of the baked nginx source tree
 # (matches the apt-installed nginx binary; --with-compat keeps the module
 # ABI-compatible so `nginx -t` can load the produced .so).
+#
+# /usr/local/src/nginx is a SYMLINK to the versioned tree
+# (t/docker/Dockerfile.dynamic), and that tree already carries image-build-time
+# objs/ artifacts — including correctly-built zstd module .so files. A plain
+# `cp -a` would copy the symlink itself, so every case would build INSIDE the
+# baked tree and the `test -f objs/*.so` + `nginx -t` assertions could pass
+# against the stale image-era .so even if the current tree's configure
+# silently dropped the module (vacuous `make modules`). `cp -aL` dereferences
+# into a real copy and `rm -rf objs` closes that false-pass window; the
+# `[ ! -e objs ]` assert proves each case starts from a clean tree.
 PREAMBLE='
 set -euo pipefail
-cp -a /usr/local/src/nginx /tmp/nginx-build
+cp -aL /usr/local/src/nginx /tmp/nginx-build
+rm -rf /tmp/nginx-build/objs
 cd /tmp/nginx-build
+[ ! -e objs ] || { echo "ASSERT-FAIL: objs/ present before configure"; exit 1; }
 '
 
 # --- case filter-only ------------------------------------------------------
@@ -163,9 +175,11 @@ run_case combined-hygiene "$PREAMBLE"'
     --with-ld-opt=-L/opt/n033-sentinel
 
 # extract_recipe <module>: the objs/Makefile block from the .so target line
-# through the $(LINK) recipe. auto/make emits a blank line BETWEEN the
-# dependency list and the recipe, so stop at the SECOND blank line (the one
-# after the recipe), not the first.
+# through the $(LINK) recipe. There is no blank line inside the block (deps
+# and recipe are backslash-continued); auto/make follows the recipe with TWO
+# consecutive blank lines — one from the empty $ngx_long_end expansion (unix
+# auto/cc/conf leaves it empty), one from heredoc spacing before the next
+# target. Stopping at the second blank captures the whole block either way.
 extract_recipe() {
     awk -v target="objs/$1.so:" "
         index(\$0, target) == 1 { f = 1 }

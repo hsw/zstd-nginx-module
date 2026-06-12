@@ -273,8 +273,8 @@ fi
 # run_skippable_gate <script> <label> — run a host-side gate script that
 # follows the autoconf SKIP convention. Captures rc explicitly so we can
 # distinguish 0/pass from 77/skip from any other non-zero exit (fail). A
-# bare `if bash ...` would lump 77 in with 0 and report a falsely-green
-# pass when docker / the test image is absent.
+# bare `if bash ...` would lump 77 in with the failure branch and report a
+# spurious FAIL when docker / the test image is absent.
 run_skippable_gate() {
     local script="$1"
     local label="$2"
