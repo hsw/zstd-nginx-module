@@ -111,10 +111,17 @@ run_variant() {
 
     # Defensive: nuke any stale container under the same name, plus any
     # orphaned zstd-run-* containers that might still be hogging the host port
-    # from a prior aborted invocation.
+    # from a prior aborted invocation. The filter regex MUST be anchored:
+    # docker name filters are unanchored regex matches, so a bare
+    # "name=zstd-run-${variant}-" for variant ubuntu-24.04 also matches the
+    # ubuntu-24.04-{shared-only,brotli,dynamic-brotli} containers — under
+    # t/matrix-parallel.sh that sweep `docker rm -f`s SIBLING variants
+    # mid-pytest (exactly what happened when the build-isolation gate skewed
+    # this variant's start by ~30s). `[0-9]+$` pins the suffix to our own
+    # `-$$` PID convention, which no other variant name can extend into.
     docker rm -f "$cname" >/dev/null 2>&1 || true
     local orphan
-    for orphan in $(docker ps -q --filter "name=zstd-run-${variant}-"); do
+    for orphan in $(docker ps -q --filter "name=^zstd-run-${variant}-[0-9]+\$"); do
         docker rm -f "$orphan" >/dev/null 2>&1 || true
     done
 
@@ -291,6 +298,50 @@ case "$rc" in
         SUMMARY_LINES+=("explicit-paths: fail (rc=${rc})")
         ;;
 esac
+
+# Build-isolation regression (audit Tier-3 C11-1/C11-2/C11-4/N03-3/N03-4):
+# filter-only / static-only / combined configure+make hygiene inside the
+# ubuntu-24.04 image. Unlike explicit-paths (one cheap configure+make, run
+# unconditionally), this is MULTI-MINUTE (several configure passes + module
+# builds) and t/matrix-parallel.sh invokes t/run.sh once per variant in
+# parallel — so gate on the variant SELECTION, not just image presence:
+# only the invocation that includes ubuntu-24.04 (the image the script
+# targets) pays the cost, instead of N duplicate parallel copies. A full
+# serial `bash t/run.sh` still covers it exactly once.
+run_build_isolation=no
+for v in "${VARIANTS[@]}"; do
+    if [ "$v" = "ubuntu-24.04" ]; then
+        run_build_isolation=yes
+    fi
+done
+echo "==> build-isolation (host-side)"
+if [ "$run_build_isolation" = yes ]; then
+    # Same 0/77/* discrimination as explicit-paths above: 77 is the autoconf
+    # SKIP convention (docker / test image absent) and must not count as pass.
+    bash "${REPO_ROOT}/t/test-build-isolation.sh"
+    rc=$?
+    case "$rc" in
+        0)
+            echo "  pass  build-isolation"
+            variant_inc_pass "build-isolation"
+            SUMMARY_LINES+=("build-isolation: pass")
+            ;;
+        77)
+            echo "  skip  build-isolation (docker/image absent)"
+            variant_inc_skip "build-isolation"
+            SUMMARY_LINES+=("build-isolation: skip (docker/image absent)")
+            ;;
+        *)
+            echo "  fail  build-isolation rc=${rc}"
+            variant_inc_fail "build-isolation"
+            SUMMARY_LINES+=("build-isolation: fail (rc=${rc})")
+            ;;
+    esac
+else
+    echo "  skip  build-isolation (ubuntu-24.04 not in variant selection)"
+    variant_inc_skip "build-isolation"
+    SUMMARY_LINES+=("build-isolation: skip (ubuntu-24.04 not selected)")
+fi
 
 # Host-side CI plumbing regressions: debian/ packaging contract + t/build.sh
 # env passthrough. All three run in milliseconds, no Docker / network, so

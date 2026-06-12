@@ -12,12 +12,11 @@
 # libnginx-mod-http-zstd-static).
 #
 # This mirrors t/docker/build-module.sh (the proven test harness path).
-# Passing each subdir as its own --add-dynamic-module is WRONG: filter/config
-# and static/config both prepend `filter/` / `static/` to their source paths
-# relative to $ngx_addon_dir (which they expect to be the repo root), so e.g.
-# --add-dynamic-module=$(CURDIR)/filter would yield a doubled path
-# `$(CURDIR)/filter/filter/ngx_http_zstd_filter_module.c` that `make modules`
-# cannot resolve.
+# The single root add is the packaging contract: one configure+make pass
+# builds both .so artefacts. Per-subdir adds (--add-dynamic-module=
+# $(CURDIR)/filter or /static) also work — the configs detect the add
+# layout when resolving their source paths — but each would need its own
+# configure+make pass, for no benefit here.
 #
 # To re-scaffold from pkg-oss in the future:
 #   hg clone https://hg.nginx.org/pkg-oss && hg -R pkg-oss id
@@ -29,6 +28,10 @@
 #                (default: empty; uses /usr/include via libzstd-dev)
 #   ZSTD_LIB   — additional -L path for libzstd library (consumed via $(if ...) below).
 #                (default: empty; uses /usr/lib via libzstd-dev)
+#                Set ZSTD_INC and ZSTD_LIB together or not at all: besides
+#                the $(if ...) consumption below, both are inherited by nginx
+#                configure as environment variables, and filter/config
+#                hard-fails a half-set pair (both-or-none guard).
 #   NGINX_SRC  — path to unpacked nginx source tree (consumed via `?=` default below).
 #                (default: /usr/local/src/nginx, the symlink set by
 #                t/ci/install-nginx-mainline.sh to /usr/local/src/nginx-${VER}/)
@@ -51,8 +54,8 @@ override_dh_auto_configure:
 	# Single --add-dynamic-module pointing at the repo root. The top-level
 	# `config` (at $(CURDIR)/config) sources both filter/config and
 	# static/config, producing BOTH .so artefacts from one configure+make.
-	# See the file header comment for why passing each subdir separately is
-	# wrong (doubled-path bug in `make modules`).
+	# See the file header comment for why the single root add is preferred
+	# over per-subdir adds.
 	cd $(NGINX_SRC) && ./configure \
 	    --with-compat \
 	    $(ZSTD_CC_OPT) \

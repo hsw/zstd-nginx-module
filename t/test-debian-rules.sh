@@ -84,17 +84,16 @@ fi
 # Exactly ONE --add-dynamic-module= invocation, pointing at the repo root
 # ($(CURDIR)). The top-level config sources both filter/config and
 # static/config, so a single configure invocation produces BOTH .so
-# artefacts. Passing each subdir separately yields a doubled-path bug
-# (filter/config prepends `filter/` to source paths relative to
-# $ngx_addon_dir, so --add-dynamic-module=$(CURDIR)/filter resolves to
-# $(CURDIR)/filter/filter/ngx_http_zstd_filter_module.c at make time).
+# artefacts — that single root add is the packaging contract (per-subdir
+# adds work too since the configs detect the add layout, but each would
+# need its own configure+make pass for no benefit in the deb build).
 # Mirrors t/docker/build-module.sh:84 (the proven test path).
 assert_grep_present "$RULES" \
     '--add-dynamic-module=\$\(CURDIR\)[[:space:]]*$' \
     "debian/rules configure includes --add-dynamic-module=\$(CURDIR) (single flag, repo root)"
 
-# Guard against re-introduction of the doubled-path bug: no
-# --add-dynamic-module pointing at a /filter or /static subdir.
+# Guard the single-root-add packaging contract: no --add-dynamic-module
+# pointing at a /filter or /static subdir.
 assert_grep_absent() {
     local file="$1"
     local pattern="$2"
@@ -117,7 +116,7 @@ assert_grep_absent() {
 # subdir, or referencing the old MODULE_FILTER/MODULE_STATIC Make variables.
 assert_grep_absent "$RULES" \
     '^[[:space:]]+--add-dynamic-module=.*(MODULE_FILTER|MODULE_STATIC|/filter|/static)' \
-    "debian/rules does NOT pass per-subdir --add-dynamic-module (would cause doubled-path bug)"
+    "debian/rules does NOT pass per-subdir --add-dynamic-module (single root add is the packaging contract)"
 
 # Build-Depends must include libzstd-dev — the filter module links libzstd.
 # debhelper-compat is the dh sequencer version pin. libzstd-dev is OUR

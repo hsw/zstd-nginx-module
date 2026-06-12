@@ -43,10 +43,11 @@ ngx_module_order="ngx_http_static_module \
 if [ "$ngx_module_link" != DYNAMIC ]; then
     # ngx_module_order doesn't work with static modules (only honoured for
     # --add-dynamic-module builds), so we must reorder HTTP_MODULES here.
-    # Mirror filter/config:131 pattern: pick the next module by precedence
-    # so the source-list order ends up as zstd_static before brotli_static
-    # / gzip_static — nginx wraps content handlers in LIFO order, so a later
-    # source-list entry runs earlier in the runtime chain.
+    # Mirror filter/config's reorder pattern: pick the insertion target by
+    # precedence so the source-list order ends up as (brotli_static /
+    # gzip_static / static) before zstd_static — nginx wraps content handlers
+    # in LIFO order, so the later zstd_static entry runs earlier in the
+    # runtime chain and wins when multiple sidecars exist.
     if echo $HTTP_MODULES | grep ngx_http_brotli_static_module >/dev/null; then
         next=ngx_http_brotli_static_module
     elif echo $HTTP_MODULES | grep ngx_http_gzip_static_module >/dev/null; then

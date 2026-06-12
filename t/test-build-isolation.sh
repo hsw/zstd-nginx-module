@@ -14,10 +14,16 @@
 #                         compiles, and the .so loads under `nginx -t`
 #   static-only           --add-dynamic-module=<repo>/static alone builds and
 #                         the .so has NO libzstd in its NEEDED entries
-#   combined-hygiene      root-config build: filter .so NEEDS libzstd,
-#                         static .so does NOT
+#   combined-hygiene      root-config build with a sentinel --with-ld-opt:
+#                         link-recipe-level asserts (static .so recipe has no
+#                         libzstd; NGX_LD_OPT appears exactly once per module
+#                         recipe) plus the NEEDED checks
 #   half-set              exactly one of ZSTD_INC/ZSTD_LIB set => configure
-#                         fails fast with an error naming BOTH variables
+#                         fails fast via the both-or-none guard, naming BOTH
+#                         variables
+#   static-explicit-paths static --add-module with ZSTD_INC/ZSTD_LIB set:
+#                         archive-first probe wins; with libzstd.a hidden the
+#                         shared fallback wins and no .a leaks into the link
 #   static-only-no-libzstd  with zstd.h + libzstd hidden, the static-only
 #                         build still succeeds (module uses no zstd symbol)
 #   makefile-hygiene      combined configure leaves no `-I -D…` / `-I -I…`
@@ -97,11 +103,11 @@ cd /tmp/nginx-build
 '
 
 # --- case filter-only ------------------------------------------------------
-# C11-1: filter/config must be self-contained. Today configure passes (the
-# feature probe carries -DZSTD_STATIC_LINKING_ONLY via CC_TEST_FLAGS) but
-# `make modules` fails: ngx_module_incs holds flag-shaped tokens that
-# auto/make rewrites to `-I -DZSTD_STATIC_LINKING_ONLY`, so the compiler
-# never sees the define and zstd.h hides ZSTD_customMem.
+# C11-1: filter/config must be self-contained. Pre-fix, configure passed (the
+# feature probe carried -DZSTD_STATIC_LINKING_ONLY via CC_TEST_FLAGS) but
+# `make modules` broke: ngx_module_incs held flag-shaped tokens that
+# auto/make rewrote to `-I -DZSTD_STATIC_LINKING_ONLY`, so the compiler
+# never saw the define and zstd.h hid ZSTD_customMem.
 run_case filter-only "$PREAMBLE"'
 ./configure --with-compat --add-dynamic-module=/src-current/filter
 make -j"$(nproc)" modules
@@ -140,8 +146,58 @@ nginx -c /tmp/test-nginx.conf -t
 # Root-config build (the path every Docker variant already exercises): the
 # filter .so legitimately links libzstd; the static .so must not inherit it
 # (C11-4 stale ngx_module_libs / N03-3 NGX_LD_OPT duplication).
+#
+# The teeth are at the objs/Makefile LINK-RECIPE level: the NEEDED checks
+# below are supplementary only — gcc defaults to -Wl,--as-needed on Ubuntu,
+# which strips an unused -lzstd from NEEDED, so pre-fix link-line pollution
+# never showed up there.
+#
+#   C11-4: the static .so link recipe must carry no libzstd at all.
+#   N03-3: configure with a sentinel --with-ld-opt. nginx legitimately puts
+#          NGX_LD_OPT ONCE on every dynamic-module link recipe
+#          (auto/make:609-610 emits "$NGX_LD_OPT $ngx_module_libs"); the bug
+#          duplicated it by assigning ngx_module_libs=$NGX_LD_OPT. Assert
+#          the sentinel appears EXACTLY ONCE per module recipe.
 run_case combined-hygiene "$PREAMBLE"'
-./configure --with-compat --add-dynamic-module=/src-current
+./configure --with-compat --add-dynamic-module=/src-current \
+    --with-ld-opt=-L/opt/n033-sentinel
+
+# extract_recipe <module>: the objs/Makefile block from the .so target line
+# through the $(LINK) recipe. auto/make emits a blank line BETWEEN the
+# dependency list and the recipe, so stop at the SECOND blank line (the one
+# after the recipe), not the first.
+extract_recipe() {
+    awk -v target="objs/$1.so:" "
+        index(\$0, target) == 1 { f = 1 }
+        f && /^\$/ { blank++; if (blank == 2) exit }
+        f { print }
+    " objs/Makefile
+}
+extract_recipe ngx_http_zstd_filter_module > /tmp/filter-recipe.txt
+extract_recipe ngx_http_zstd_static_module > /tmp/static-recipe.txt
+test -s /tmp/filter-recipe.txt
+test -s /tmp/static-recipe.txt
+
+# C11-4: no libzstd in the static .so link recipe. Do NOT grep bare "zstd" —
+# the module source paths in the recipe contain it.
+if grep -E -- "-lzstd|libzstd\.(a|so)" /tmp/static-recipe.txt; then
+    echo "ASSERT-FAIL: static .so link recipe references libzstd (lines above)"
+    exit 1
+fi
+if ! grep -qE -- "-lzstd|libzstd\.(a|so)" /tmp/filter-recipe.txt; then
+    echo "ASSERT-FAIL: filter .so link recipe is MISSING libzstd"
+    exit 1
+fi
+
+# N03-3: sentinel exactly once per module link recipe.
+for m in filter static; do
+    n=$( (grep -o -- "-L/opt/n033-sentinel" /tmp/$m-recipe.txt || true) | wc -l)
+    if [ "$n" -ne 1 ]; then
+        echo "ASSERT-FAIL: --with-ld-opt sentinel appears $n times in the $m .so link recipe (expected exactly 1)"
+        exit 1
+    fi
+done
+
 make -j"$(nproc)" modules
 test -f objs/ngx_http_zstd_filter_module.so
 test -f objs/ngx_http_zstd_static_module.so
@@ -162,7 +218,11 @@ fi
 # --- case half-set ---------------------------------------------------------
 # C11-2: exactly one of ZSTD_INC/ZSTD_LIB set must make configure fail fast
 # with an error naming BOTH variables (instead of emitting dangling -I/-L
-# that swallow the next flag).
+# that swallow the next flag). Asserting the guard's distinctive "must be
+# set together" phrase matters: the pre-fix ZSTD_INC-only failure mode
+# (probe link failure) already exited 1 with a message naming both
+# variables, so a names-only grep could not tell the guard from the old
+# accidental probe failure.
 run_case half-set "$PREAMBLE"'
 set +e
 
@@ -179,30 +239,83 @@ echo "ZSTD_LIB-only: configure exit code $rc_lib"
 tail -8 /tmp/half-lib.log
 
 fail=0
-for v in inc lib; do
-    eval rc=\$rc_$v
-    if [ "$rc" -eq 0 ]; then
-        echo "ASSERT-FAIL: half-set ($v-only) configure succeeded; must fail fast"
+# check_half <inc|lib> <configure-exit-code>
+check_half() {
+    if [ "$2" -eq 0 ]; then
+        echo "ASSERT-FAIL: half-set ($1-only) configure succeeded; must fail fast"
         fail=1
-    elif ! grep -q ZSTD_INC /tmp/half-$v.log || ! grep -q ZSTD_LIB /tmp/half-$v.log; then
-        echo "ASSERT-FAIL: half-set ($v-only) error does not name both ZSTD_INC and ZSTD_LIB"
+    elif ! grep -q "must be set together" /tmp/half-$1.log; then
+        echo "ASSERT-FAIL: half-set ($1-only) failure is not the both-or-none guard"
+        fail=1
+    elif ! grep -q ZSTD_INC /tmp/half-$1.log || ! grep -q ZSTD_LIB /tmp/half-$1.log; then
+        echo "ASSERT-FAIL: half-set ($1-only) error does not name both ZSTD_INC and ZSTD_LIB"
         fail=1
     fi
-done
+}
+check_half inc "$rc_inc"
+check_half lib "$rc_lib"
 exit $fail
+'
+
+# --- case static-explicit-paths --------------------------------------------
+# Explicit-path STATIC branch of filter/config (--add-module with
+# ZSTD_INC/ZSTD_LIB set): two consecutive auto/feature probes — the archive
+# ($ZSTD_LIB/libzstd.a) is tried first, the shared library is the fallback.
+# Configure-level assertions only (a full static nginx make is not needed to
+# prove the probe/link wiring):
+#
+#   run 1 (libzstd.a present): the "ZStandard static library in ..." probe
+#         wins and the archive path lands in objs/Makefile.
+#   run 2 (libzstd.a hidden):  the archive probe reports "not found", the
+#         shared "ZStandard dynamic library in ..." fallback wins, and NO
+#         libzstd.a leaks into objs/Makefile — this is the per-probe
+#         ngx_feature_libs reassignment contract (a stale first-probe value
+#         would link the .a path on the fallback too).
+run_case static-explicit-paths "$PREAMBLE"'
+export ZSTD_INC=/usr/include
+export ZSTD_LIB="/usr/lib/$(gcc -print-multiarch)"
+if [ ! -f /usr/include/zstd.h ] || [ ! -f "$ZSTD_LIB/libzstd.a" ]; then
+    echo "ENV-FAIL: libzstd dev artifacts not at the assumed Ubuntu layout"
+    exit 1
+fi
+
+./configure --with-compat --add-module=/src-current > /tmp/static-archive.log 2>&1
+grep -E "ZStandard static library in .* \.\.\. found$" /tmp/static-archive.log \
+    || { echo "ASSERT-FAIL: archive-first probe did not win with libzstd.a present"; tail -20 /tmp/static-archive.log; exit 1; }
+grep -q "libzstd\.a" objs/Makefile \
+    || { echo "ASSERT-FAIL: libzstd.a missing from objs/Makefile link line"; exit 1; }
+
+mv "$ZSTD_LIB/libzstd.a" /tmp/
+./configure --with-compat --add-module=/src-current > /tmp/static-shared.log 2>&1
+grep -E "ZStandard static library in .* \.\.\. not found$" /tmp/static-shared.log \
+    || { echo "ASSERT-FAIL: archive probe unexpectedly succeeded with libzstd.a hidden"; tail -20 /tmp/static-shared.log; exit 1; }
+grep -E "ZStandard dynamic library in .* \.\.\. found$" /tmp/static-shared.log \
+    || { echo "ASSERT-FAIL: shared fallback probe did not win"; tail -20 /tmp/static-shared.log; exit 1; }
+if grep -q "libzstd\.a" objs/Makefile; then
+    echo "ASSERT-FAIL: stale libzstd.a leaked into the shared-fallback link line"
+    exit 1
+fi
+grep -qE -- "-lzstd" objs/Makefile \
+    || { echo "ASSERT-FAIL: -lzstd missing from the shared-fallback link line"; exit 1; }
 '
 
 # --- case static-only-no-libzstd -------------------------------------------
 # N03-4: hide the libzstd DEV artifacts, then a static-only build must STILL
 # succeed — the module includes no zstd header and uses no zstd symbol.
-# Today static/config runs the full feature probe and hard-exits with
+# Pre-fix, static/config ran the full feature probe and hard-exited with
 # "requires the ZStandard library". Container is discarded; no cleanup needed.
 #
 # Only the dev artifacts (header, unversioned .so symlink, archive) are
 # hidden: the runtime libzstd.so.1 must STAY — Ubuntu 24.04's cc1 itself
 # links libzstd.so.1, so hiding it breaks the compiler ("C compiler cc is
 # not found") and the case would fail for environment, not tree, reasons.
+# The explicit pre-checks keep an environment drift (different image layout
+# via IMAGE override) from surfacing as a confusing mv failure under set -e.
 run_case static-only-no-libzstd "$PREAMBLE"'
+if [ ! -f /usr/include/zstd.h ] || ! ls /usr/lib/*/libzstd.so >/dev/null 2>&1; then
+    echo "ENV-FAIL: libzstd dev artifacts not at the assumed Ubuntu layout"
+    exit 1
+fi
 mv /usr/include/zstd.h /tmp/
 mv /usr/lib/*/libzstd.so /tmp/
 mv /usr/lib/*/libzstd.a /tmp/ 2>/dev/null || true

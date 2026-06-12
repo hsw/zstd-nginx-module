@@ -8,12 +8,14 @@ ngx_feature_test="(void) ZSTD_createCCtx();"
 # Adapted from eilandert/zstd-nginx-module ae1ef75.
 ngx_feature_run=no
 
-# The probe uses only the STABLE libzstd API; ZSTD_STATIC_LINKING_ONLY (a
-# header-visibility gate for the experimental section, not a link mode) is
-# defined at the include site in ngx_http_zstd_filter_module.c, so the build
-# system carries no -D flags at all.
+# ZSTD_STATIC_LINKING_ONLY is defined at the include site in
+# ngx_http_zstd_filter_module.c (see the comment there); the probe uses only
+# the stable API, so the build system carries no -D flags at all.
 
-ngx_zstd_opt_L=
+# auto/feature defines NGX_HAVE_<name> on probe success whenever
+# ngx_feature_name is non-empty — clear any value left behind by an
+# earlier-sourced addon config so OUR probe doesn't define a foreign macro.
+ngx_feature_name=
 
 if [ -n "$ZSTD_INC" ] || [ -n "$ZSTD_LIB" ]; then
     if [ -z "$ZSTD_INC" ] || [ -z "$ZSTD_LIB" ]; then
@@ -34,8 +36,7 @@ END
         # relocation errors. Only try the shared library — fail fast if not
         # present rather than silently producing a broken .so.
         ngx_feature="ZStandard dynamic library in $ZSTD_INC and $ZSTD_LIB"
-        ngx_zstd_opt_L="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
-        ngx_feature_libs="$ngx_zstd_opt_L"
+        ngx_feature_libs="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
 
         . auto/feature
 
@@ -50,16 +51,14 @@ END
         # final nginx binary has no libzstd.so runtime dep), fall back to
         # the shared library.
         ngx_feature="ZStandard static library in $ZSTD_INC and $ZSTD_LIB"
-        ngx_zstd_opt_L="$ZSTD_LIB/libzstd.a"
-        ngx_feature_libs="$ngx_zstd_opt_L"
+        ngx_feature_libs="$ZSTD_LIB/libzstd.a"
 
         . auto/feature
 
         if [ $ngx_found = no ]; then
             # then try the dynamic shared library
             ngx_feature="ZStandard dynamic library in $ZSTD_INC and $ZSTD_LIB"
-            ngx_zstd_opt_L="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
-            ngx_feature_libs="$ngx_zstd_opt_L"
+            ngx_feature_libs="-L$ZSTD_LIB -lzstd -Wl,-rpath,$ZSTD_LIB"
 
             . auto/feature
 
@@ -77,8 +76,7 @@ else
     # archives).
     ngx_feature="ZStandard dynamic library"
     ngx_feature_path=
-    ngx_zstd_opt_L="-lzstd"
-    ngx_feature_libs="$ngx_zstd_opt_L"
+    ngx_feature_libs="-lzstd"
 
     . auto/feature
 
@@ -86,8 +84,7 @@ else
         # fall back to static archive only for static (--add-module) builds;
         # dynamic modules must link the shared library.
         ngx_feature="ZStandard static library"
-        ngx_zstd_opt_L="-l:libzstd.a"
-        ngx_feature_libs="$ngx_zstd_opt_L"
+        ngx_feature_libs="-l:libzstd.a"
 
         . auto/feature
     fi
@@ -101,6 +98,14 @@ END
 
     # TODO we need more tries for the different OS port.
 fi
+
+# Capture the winning probe's libs for the module declaration below, then
+# clear the probe inputs: auto/feature resets neither ngx_feature_path nor
+# ngx_feature_libs, so leftover values would leak into the next sourced
+# addon config's probes (same cross-config leakage class as C11-4).
+ngx_zstd_libs="$ngx_feature_libs"
+ngx_feature_libs=
+ngx_feature_path=
 
 # The module source must resolve for BOTH add layouts: sourcing via the root
 # config (--add-dynamic-module=<repo>, ngx_addon_dir = repo root) and adding
@@ -122,7 +127,7 @@ ngx_module_incs="$ZSTD_INC"
 ngx_module_srcs=$HTTP_ZSTD_SRCS
 # Only OUR link flags — assigning NGX_LD_OPT here used to duplicate the
 # operator's entire --with-ld-opt into the module's lib list.
-ngx_module_libs="$ngx_zstd_opt_L"
+ngx_module_libs="$ngx_zstd_libs"
 ngx_module_order="$ngx_module_name \
                   ngx_pagespeed \
                   ngx_http_postpone_filter_module \
