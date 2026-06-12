@@ -33,6 +33,34 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   (P12-1), and `$zstd_ratio` buffer sized for the 3-digit fraction (S01-1).
   Plus a micro-reorder of the `header_only` decline ahead of the content-type
   test (P02-1).
+- Filter-only and static-only builds (`--add-dynamic-module=<repo>/filter` /
+  `=<repo>/static`) were broken two ways. Both configs hardcoded
+  `$ngx_addon_dir/<subdir>/...` in their srcs paths, doubling the path
+  (`filter/filter/...`) when the subdir itself is added — srcs now branch on
+  the add layout, so direct subdir adds work alongside the repo root. And
+  `filter/config` routed `-DZSTD_STATIC_LINKING_ONLY` through
+  `ngx_module_incs`, which nginx's `auto/make` rewrites token-by-token to
+  `-I <token>` — the define never reached the compiler, and a filter-only
+  build failed at `make`; the combined build survived only via
+  `static/config`'s global CFLAGS side effect. The macro is now defined
+  (`#ifndef`-guarded) at the include site in the .c file, and the build
+  system carries no `-D` flags at all (C11-1).
+- Setting only one of `ZSTD_INC` / `ZSTD_LIB` used to expand a dangling
+  `-I`/`-L` that silently swallowed the next flag (a `ZSTD_LIB`-only
+  configure even passed); the pair is now both-or-none and configure fails
+  fast with an error naming both variables (C11-2).
+- `ngx_http_zstd_static_module` no longer probes for, links, or requires
+  libzstd. Its config ran the full feature probe and hard-exited when
+  libzstd was absent although the module uses no zstd symbol (N03-4), and
+  in combined builds it inherited the filter's stale `ngx_module_libs`
+  (including `-lzstd`) via cross-config variable leakage — both
+  `ngx_module_incs` and `ngx_module_libs` are now explicitly empty (C11-4).
+- The filter's module lib flags no longer duplicate the entire global
+  `NGX_LD_OPT` (including the operator's `--with-ld-opt`) into the `.so`
+  link line; `ngx_module_libs` now carries only the module's own zstd link
+  flags (N03-3). New `t/test-build-isolation.sh` covers filter-only,
+  static-only, combined-link hygiene, half-set env vars, and
+  libzstd-absent builds.
 
 ## [0.3.0] - 2026-05-22
 

@@ -70,12 +70,13 @@ server {
 
 # Installation
 
-To use theses modules, configure your nginx branch with `--add-module=/path/to/zstd-nginx-module`. Several points should be taken care of.
+To use these modules, configure your nginx branch with `--add-module=/path/to/zstd-nginx-module` (or `--add-dynamic-module=...`). Several points should be taken care of.
 
-* You can set environment variables `ZSTD_INC` and `ZSTD_LIB` to specify the path to `zstd.h` and the path to zstd shared library respectively.
+* Adding the repository root configures both `ngx_http_zstd_filter_module` and `ngx_http_zstd_static_module`. Each module can also be added standalone: `--add-dynamic-module=/path/to/zstd-nginx-module/filter` and `--add-dynamic-module=/path/to/zstd-nginx-module/static` each work on their own.
+* You can set environment variables `ZSTD_INC` and `ZSTD_LIB` to specify the path to `zstd.h` and the path to the zstd library respectively. They must be set **together**: setting only one of them is a hard configure error. (Previously a half-set pair was silently misinterpreted — the empty variable expanded into a dangling `-I`/`-L` that swallowed the next flag.)
 * auto-discovery prefers the **shared** libzstd (required for `--add-dynamic-module`, since static archives are usually not built with `-fPIC`). A static archive (`libzstd.a`) is tried as a fallback only for static `--add-module` builds. When `ZSTD_INC`/`ZSTD_LIB` are set explicitly, the branch depends on build mode: static `--add-module` builds try `$ZSTD_LIB/libzstd.a` first then fall back to the shared library, whereas `--add-dynamic-module` builds skip the archive entirely and link the shared library (so the resulting `.so` does not pull in non-PIC `.a` objects and break with `R_X86_64_PC32` relocation errors). The module includes `zstd.h` with `ZSTD_STATIC_LINKING_ONLY` to expose experimental APIs (header visibility only — not a link mode).
 * System's zstd bundle will be linked if `ZSTD_INC` and `ZSTD_LIB` are not specified.
-* Both `ngx_http_zstd_static_module` and `ngx_http_zstd_filter_module` will be configured.
+* Only the filter module depends on libzstd. `ngx_http_zstd_static_module` serves precompressed `.zst` files from disk and uses no zstd symbol — it requires libzstd neither at build time nor at run time, so a static-only build configures fine on a machine without libzstd installed.
 
 # Directives
 
