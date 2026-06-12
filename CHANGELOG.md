@@ -7,6 +7,8 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-12
+
 ### Changed
 
 - A response with a known `Content-Length: 0` is no longer compressed,
