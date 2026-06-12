@@ -80,7 +80,7 @@ else
 
     . auto/feature
 
-    if [ $ngx_found = no -a "$ngx_module_link" != DYNAMIC ]; then
+    if [ $ngx_found = no ] && [ "$ngx_module_link" != DYNAMIC ]; then
         # fall back to static archive only for static (--add-module) builds;
         # dynamic modules must link the shared library.
         ngx_feature="ZStandard static library"

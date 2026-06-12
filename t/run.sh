@@ -270,34 +270,42 @@ else
     SUMMARY_LINES+=("gate-semantics: fail (rc=${rc})")
 fi
 
+# run_skippable_gate <script> <label> — run a host-side gate script that
+# follows the autoconf SKIP convention. Captures rc explicitly so we can
+# distinguish 0/pass from 77/skip from any other non-zero exit (fail). A
+# bare `if bash ...` would lump 77 in with 0 and report a falsely-green
+# pass when docker / the test image is absent.
+run_skippable_gate() {
+    local script="$1"
+    local label="$2"
+    local rc
+    bash "${REPO_ROOT}/t/${script}"
+    rc=$?
+    case "$rc" in
+        0)
+            echo "  pass  ${label}"
+            variant_inc_pass "${label}"
+            SUMMARY_LINES+=("${label}: pass")
+            ;;
+        77)
+            echo "  skip  ${label} (docker/image absent)"
+            variant_inc_skip "${label}"
+            SUMMARY_LINES+=("${label}: skip (docker/image absent)")
+            ;;
+        *)
+            echo "  fail  ${label} rc=${rc}"
+            variant_inc_fail "${label}"
+            SUMMARY_LINES+=("${label}: fail (rc=${rc})")
+            ;;
+    esac
+}
+
 # codex4 P1.2 regression: verify the explicit-path branch of filter/static
 # config files prefers shared libzstd over libzstd.a. Self-skips if the
 # ubuntu-24.04 image isn't built (e.g. running a subset that excludes it),
 # so safe to invoke unconditionally on every t/run.sh pass.
 echo "==> explicit-paths (host-side)"
-# Capture rc explicitly so we can distinguish 0/pass from 77/skip (autoconf
-# SKIP convention) from any other non-zero exit (fail). A bare `if bash ...`
-# would lump 77 in with 0 and report a falsely-green pass when docker / the
-# test image is absent.
-bash "${REPO_ROOT}/t/test-explicit-paths.sh"
-rc=$?
-case "$rc" in
-    0)
-        echo "  pass  explicit-paths"
-        variant_inc_pass "explicit-paths"
-        SUMMARY_LINES+=("explicit-paths: pass")
-        ;;
-    77)
-        echo "  skip  explicit-paths (docker/image absent)"
-        variant_inc_skip "explicit-paths"
-        SUMMARY_LINES+=("explicit-paths: skip (docker/image absent)")
-        ;;
-    *)
-        echo "  fail  explicit-paths rc=${rc}"
-        variant_inc_fail "explicit-paths"
-        SUMMARY_LINES+=("explicit-paths: fail (rc=${rc})")
-        ;;
-esac
+run_skippable_gate test-explicit-paths.sh explicit-paths
 
 # Build-isolation regression (audit Tier-3 C11-1/C11-2/C11-4/N03-3/N03-4):
 # filter-only / static-only / combined configure+make hygiene inside the
@@ -316,31 +324,11 @@ for v in "${VARIANTS[@]}"; do
 done
 echo "==> build-isolation (host-side)"
 if [ "$run_build_isolation" = yes ]; then
-    # Same 0/77/* discrimination as explicit-paths above: 77 is the autoconf
-    # SKIP convention (docker / test image absent) and must not count as pass.
-    bash "${REPO_ROOT}/t/test-build-isolation.sh"
-    rc=$?
-    case "$rc" in
-        0)
-            echo "  pass  build-isolation"
-            variant_inc_pass "build-isolation"
-            SUMMARY_LINES+=("build-isolation: pass")
-            ;;
-        77)
-            echo "  skip  build-isolation (docker/image absent)"
-            variant_inc_skip "build-isolation"
-            SUMMARY_LINES+=("build-isolation: skip (docker/image absent)")
-            ;;
-        *)
-            echo "  fail  build-isolation rc=${rc}"
-            variant_inc_fail "build-isolation"
-            SUMMARY_LINES+=("build-isolation: fail (rc=${rc})")
-            ;;
-    esac
+    run_skippable_gate test-build-isolation.sh build-isolation
 else
     echo "  skip  build-isolation (ubuntu-24.04 not in variant selection)"
     variant_inc_skip "build-isolation"
-    SUMMARY_LINES+=("build-isolation: skip (ubuntu-24.04 not selected)")
+    SUMMARY_LINES+=("build-isolation: skip (ubuntu-24.04 not in variant selection)")
 fi
 
 # Host-side CI plumbing regressions: debian/ packaging contract + t/build.sh

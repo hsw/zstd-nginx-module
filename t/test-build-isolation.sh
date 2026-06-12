@@ -52,7 +52,7 @@ fi
 # under Docker Desktop's containerd-snapshotter, `image inspect` by name:tag
 # returns "No such image" for buildkit-produced multi-arch manifest entries
 # even when the image is fully usable via `docker run`. `images -q` resolves
-# the tag correctly in both stores. Mirrors t/run.sh:99.
+# the tag correctly in both stores. Mirrors the presence check in t/run.sh.
 if [ -z "$(docker images -q "$IMAGE" 2>/dev/null)" ]; then
     echo "SKIP: image $IMAGE not built (run \`bash t/build.sh ubuntu-24.04\` first)"
     exit 77
