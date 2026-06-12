@@ -8,6 +8,21 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+/*
+ * ZSTD_STATIC_LINKING_ONLY is a header-visibility gate, NOT a link mode:
+ * it exposes the experimental section of zstd.h, where ZSTD_customMem,
+ * ZSTD_createCStream_advanced, ZSTD_getCParams and ZSTD_estimateCStreamSize*
+ * live. Defined here, at the include site, so the module compiles
+ * standalone no matter how it is added to the nginx build — routing the
+ * define through build flags proved fragile (ngx_module_incs tokens are
+ * rewritten to `-I <token>` by auto/make, swallowing -D flags). Guarded:
+ * an operator may still pass -DZSTD_STATIC_LINKING_ONLY (=1) via
+ * --with-cc-opt, and a bare re-#define would trip -Werror as a macro
+ * redefinition with a different replacement list.
+ */
+#ifndef ZSTD_STATIC_LINKING_ONLY
+#define ZSTD_STATIC_LINKING_ONLY
+#endif
 #include <zstd.h>
 
 
