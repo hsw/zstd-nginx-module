@@ -169,11 +169,11 @@ jobs:
         # repo currently advertises, which diverges from Installed when
         # workflow_dispatch pins an older `nginx_version` while the mainline
         # repo has already moved on. Reading Candidate would produce an ABI
-        # pin (debian/control >> X.Y, << X.Y+1) that disagrees with the binary
-        # the module was compiled against — the exact silent-mismatch failure
-        # mode this workflow is designed to avoid.
+        # pin (debian/control >= x.y.z, << x.y.z+1) that disagrees with the
+        # binary the module was compiled against — the exact silent-mismatch
+        # failure mode this workflow is designed to avoid.
         # The `sed 's/-.*//'` strip drops the apt -<distro_revision> suffix
-        # (e.g. `1.29.5-1~jammy` → `1.29.5`) so debian/prepare.sh receives a
+        # (e.g. `1.31.2-1~jammy` → `1.31.2`) so debian/prepare.sh receives a
         # clean upstream version. dpkg-query exits non-zero if nginx is
         # missing, which surfaces as a hard failure under set -e (correct).
         # nginx-dev is intentionally NOT installed here: Ubuntu's nginx-dev

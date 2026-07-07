@@ -78,6 +78,19 @@ To use these modules, configure your nginx branch with `--add-module=/path/to/zs
 * System's zstd bundle will be linked if `ZSTD_INC` and `ZSTD_LIB` are not specified.
 * Only the filter module depends on libzstd. `ngx_http_zstd_static_module` serves precompressed `.zst` files from disk and uses no zstd symbol — it requires libzstd neither at build time nor at run time, so a static-only build configures fine on a machine without libzstd installed.
 
+## Prebuilt `.deb` packages
+
+The release workflow publishes `libnginx-mod-http-zstd-filter` and `libnginx-mod-http-zstd-static` `.deb` packages. They target **nginx.org mainline only** (not the distro nginx).
+
+* After `apt install libnginx-mod-http-zstd-filter` (or `...-static`), the postinst prints a banner but does **not** enable the module for you. To enable it, add the printed line to the **main** context of `/etc/nginx/nginx.conf` — at the top level, *not* inside `http{}`:
+
+  ```
+  load_module modules/ngx_http_zstd_filter_module.so;
+  ```
+
+  (use `ngx_http_zstd_static_module.so` for the static package), then `nginx -s reload` (or `systemctl reload nginx`).
+* The package pins nginx to the **exact** nginx.org mainline version it was built against, e.g. a build against `1.31.2` depends on `nginx (>= 1.31.2), nginx (<< 1.31.3)`. nginx core rejects a dynamic module whose compiled-in version differs from the running binary, so `apt` holds nginx at that exact version — or offers to remove the module — rather than let an upgrade silently break the next reload.
+
 # Directives
 
 ## ngx_http_zstd_filter_module
