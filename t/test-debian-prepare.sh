@@ -5,14 +5,14 @@
 # Replays the bundled control.in.fixture through debian/prepare.sh and
 # compares stdout / written control file to the expected fixtures.
 #
-# The substitution rule (pkg-oss convention):
-#     NGINX_VERSION_LOWER = <major>.<minor>.0           (floor of current minor)
-#     NGINX_VERSION_UPPER = <major>.<minor+1>.0         (next minor, .0 patch)
+# The substitution rule (patch-exact ABI pin):
+#     NGINX_VERSION_LOWER = <major>.<minor>.<patch>     (exact build version)
+#     NGINX_VERSION_UPPER = <major>.<minor>.<patch+1>   (next patch release)
 #
 # Fixtures live in t/fixtures/debian/:
 #   - control.in.fixture                — input with @NGINX_VERSION_*@ placeholders
-#   - expected-control-1.29.5.txt       — happy path (LOWER=1.29.0 UPPER=1.30.0)
-#   - expected-control-1.29.0.txt       — edge case (current already .0)
+#   - expected-control-1.29.5.txt       — happy path (LOWER=1.29.5 UPPER=1.29.6)
+#   - expected-control-1.29.0.txt       — edge case (patch already .0)
 #
 # Run:   bash t/test-debian-prepare.sh
 # Exit:  0 = all assertions hold; 1 = any assertion failed; 2 = harness error
@@ -112,10 +112,10 @@ assert_rejects() {
 echo "=== debian/prepare.sh substitution ==="
 
 assert_substitution "1.29.5" "${FIX_DIR}/expected-control-1.29.5.txt" \
-    "happy path: 1.29.5 → LOWER=1.29.0 UPPER=1.30.0"
+    "happy path: 1.29.5 → LOWER=1.29.5 UPPER=1.29.6"
 
 assert_substitution "1.29.0" "${FIX_DIR}/expected-control-1.29.0.txt" \
-    "edge: current is already .0 (1.29.0 → LOWER=1.29.0 UPPER=1.30.0)"
+    "edge: patch is already .0 (1.29.0 → LOWER=1.29.0 UPPER=1.29.1)"
 
 echo
 echo "=== debian/prepare.sh input validation ==="
@@ -131,17 +131,17 @@ assert_rejects "trailing whitespace (\"1.29.5 \")" "1.29.5 "
 assert_rejects "pre-release suffix (1.29.5-beta1)" "1.29.5-beta1"
 
 echo
-echo "=== debian/prepare.sh minor-rollover edge ==="
+echo "=== debian/prepare.sh patch-rollover edge ==="
 
-# T4: ensure minor=9 increments to minor=10 (string-vs-arithmetic trap).
+# T4: ensure patch=9 increments to patch=10 (string-vs-arithmetic trap).
 # Build expected control on the fly from the fixture so we don't need to
 # commit yet another expected-* file for a one-off math check.
-rollover_expected="${work_dir}/expected-control-1.9.0.txt"
-sed -e 's/@NGINX_VERSION_LOWER@/1.9.0/g' \
-    -e 's/@NGINX_VERSION_UPPER@/1.10.0/g' \
+rollover_expected="${work_dir}/expected-control-1.29.9.txt"
+sed -e 's/@NGINX_VERSION_LOWER@/1.29.9/g' \
+    -e 's/@NGINX_VERSION_UPPER@/1.29.10/g' \
     "$CONTROL_IN_FIXTURE" > "$rollover_expected"
-assert_substitution "1.9.0" "$rollover_expected" \
-    "minor=9 rollover (1.9.0 → LOWER=1.9.0 UPPER=1.10.0)"
+assert_substitution "1.29.9" "$rollover_expected" \
+    "patch=9 rollover (1.29.9 → LOWER=1.29.9 UPPER=1.29.10)"
 
 echo
 echo "=== debian/prepare.sh production control.in round-trip ==="
@@ -169,10 +169,10 @@ elif grep -q '@NGINX_VERSION_' "${prod_dir}/debian/control"; then
     grep '@NGINX_VERSION_' "${prod_dir}/debian/control" | sed 's/^/         /'
     fail_count=$((fail_count + 1))
 else
-    lower_hits=$(grep -c 'nginx (>> 1.29.0)' "${prod_dir}/debian/control" || true)
-    upper_hits=$(grep -c 'nginx (<< 1.30.0)' "${prod_dir}/debian/control" || true)
+    lower_hits=$(grep -c 'nginx (>= 1.29.5)' "${prod_dir}/debian/control" || true)
+    upper_hits=$(grep -c 'nginx (<< 1.29.6)' "${prod_dir}/debian/control" || true)
     if [ "$lower_hits" -eq 2 ] && [ "$upper_hits" -eq 2 ]; then
-        printf '  PASS  %s (both packages pin lower=1.29.0 upper=1.30.0)\n' "$prod_label"
+        printf '  PASS  %s (both packages pin lower=1.29.5 upper=1.29.6)\n' "$prod_label"
         pass_count=$((pass_count + 1))
     else
         printf '  FAIL  %s — expected 2 of each pin, got lower=%d upper=%d\n' \

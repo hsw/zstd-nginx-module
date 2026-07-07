@@ -5,9 +5,9 @@
 # Usage: debian/prepare.sh <nginx_version>
 #   nginx_version  e.g. "1.29.5"
 #
-# Substitution rule (pkg-oss convention):
-#   NGINX_VERSION_LOWER = <major>.<minor>.0         (floor of current minor)
-#   NGINX_VERSION_UPPER = <major>.<minor+1>.0       (next minor, .0 patch)
+# Substitution rule (patch-exact ABI pin):
+#   NGINX_VERSION_LOWER = <major>.<minor>.<patch>     (exact build version)
+#   NGINX_VERSION_UPPER = <major>.<minor>.<patch+1>   (next patch release)
 #
 # Reads:  debian/control.in  (relative to CWD)
 # Writes: debian/control
@@ -41,10 +41,12 @@ fi
 
 major="${BASH_REMATCH[1]}"
 minor="${BASH_REMATCH[2]}"
-# patch component intentionally ignored — ABI pin is per-minor
+# patch component pins the exact ABI — nginx core rejects any dynamic module
+# whose compiled-in nginx_version differs from the running binary, so the pin
+# is patch-exact: [patch, patch+1).
 
-lower="${major}.${minor}.0"
-upper="${major}.$((minor + 1)).0"
+lower="${major}.${minor}.${BASH_REMATCH[3]}"
+upper="${major}.${minor}.$((BASH_REMATCH[3] + 1))"
 
 input="debian/control.in"
 output="debian/control"

@@ -10,7 +10,7 @@ Vcs-Git: https://github.com/shomenkow/zstd-nginx-module.git
 
 Package: libnginx-mod-http-zstd-filter
 Architecture: any
-Depends: nginx (>> @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
+Depends: nginx (>= @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
 Description: Zstandard compression filter module for nginx
  On-the-fly Zstandard response compression filter for nginx using libzstd's
  streaming API. Compresses outgoing HTTP response bodies when the client
@@ -18,7 +18,7 @@ Description: Zstandard compression filter module for nginx
 
 Package: libnginx-mod-http-zstd-static
 Architecture: any
-Depends: nginx (>> @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
+Depends: nginx (>= @NGINX_VERSION_LOWER@), nginx (<< @NGINX_VERSION_UPPER@), ${shlibs:Depends}, ${misc:Depends}
 Description: Zstandard static (precompressed sidecar) module for nginx
  Serves precompressed Zstandard sidecar files (.zst) directly from disk when
  the client advertises support via Accept-Encoding: zstd. Companion to the
