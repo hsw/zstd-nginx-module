@@ -23,7 +23,11 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   silently loaded nothing. Each postinst now prints an nginx.org-style
   banner instructing the operator to add the `load_module modules/...so;`
   line to `/etc/nginx/nginx.conf` and reload. The now-obsolete `*.postrm`
-  scripts (which only tore the symlink down) were removed.
+  scripts (which only tore the symlink down) were removed. Operators
+  upgrading from a version ≤ 0.4.0 that previously created
+  `/etc/nginx/modules-enabled/50-mod-http-zstd-{filter,static}.conf` should
+  remove that stale symlink manually; on nginx.org mainline (the sole target)
+  it is inert since that `nginx.conf` never sources `modules-enabled`.
 
 ## [0.4.0] - 2026-06-12
 

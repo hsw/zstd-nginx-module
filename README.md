@@ -90,6 +90,7 @@ The release workflow publishes `libnginx-mod-http-zstd-filter` and `libnginx-mod
 
   (use `ngx_http_zstd_static_module.so` for the static package), then `nginx -s reload` (or `systemctl reload nginx`).
 * The package pins nginx to the **exact** nginx.org mainline version it was built against, e.g. a build against `1.31.2` depends on `nginx (>= 1.31.2), nginx (<< 1.31.3)`. nginx core rejects a dynamic module whose compiled-in version differs from the running binary, so `apt` holds nginx at that exact version — or offers to remove the module — rather than let an upgrade silently break the next reload.
+* Upgrading from ≤ 0.4.0? Remove the stale `/etc/nginx/modules-enabled/50-mod-http-zstd-*.conf` symlink the old package created — it is inert on nginx.org mainline (which never sources `modules-enabled`), but leaving it behind is untidy.
 
 # Directives
 

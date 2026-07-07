@@ -172,15 +172,18 @@ assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
     'load_module modules/ngx_http_zstd_static_module\.so' \
     "static postinst banner names load_module ngx_http_zstd_static_module.so"
 
-# Negative regression guard: neither postinst may reintroduce the
-# modules-enabled symlink dance (dead on nginx.org mainline). Guards against a
-# future pkg-oss re-scaffold silently bringing back `ln -s .../modules-enabled`.
+# Negative regression guard: the postinst must not reference the
+# modules-enabled symlink mechanism at all (neither create nor clean up) — it
+# is print-only. Forbid both `modules-enabled` and `ln -s` so a future pkg-oss
+# re-scaffold can't silently bring back either the `ln -s .../modules-enabled`
+# creation dance or any modules-enabled filesystem op (dead on nginx.org
+# mainline, whose nginx.conf never sources modules-enabled).
 assert_grep_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
     'modules-enabled|ln -s' \
-    "filter postinst does NOT create a modules-enabled symlink"
+    "filter postinst does NOT reference the modules-enabled symlink mechanism"
 assert_grep_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
     'modules-enabled|ln -s' \
-    "static postinst does NOT create a modules-enabled symlink"
+    "static postinst does NOT reference the modules-enabled symlink mechanism"
 
 # Each postinst MUST keep the `configure` guard and the `#DEBHELPER#` token.
 # The guard is the standard Debian maintainer-script arm (mirrors nginx.org's
@@ -226,6 +229,17 @@ assert_file_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postrm" \
 # actually reaches stdout: the banner on `configure`, and NOTHING on a
 # non-configure arg. (The literal `#DEBHELPER#` line is a `#`-comment under
 # `sh`, so running the script directly is harmless.)
+# NOTE: the postinst is pure print-only — it performs NO filesystem writes on
+# any argument (it only `cat`s a banner heredoc to stdout on `configure`). So
+# executing it for real in the throwaway sandbox has no filesystem side effect
+# at all; sandbox execution is fully safe.
+#
+# Hardening: an infrastructure failure (mktemp -d / cd / sh not running) must be
+# a hard FAIL, never masquerade as a pass — otherwise the SILENT helper in
+# particular goes false-green (a skipped run produces empty output). Each helper
+# below verifies mktemp succeeded and yielded a real dir, that cd into it
+# succeeded, and that the script actually executed (rc captured) before judging
+# the captured stdout.
 assert_postinst_emits_on_configure() {
     local script="$1"
     local pattern="$2"
@@ -235,10 +249,29 @@ assert_postinst_emits_on_configure() {
         fail_count=$((fail_count + 1))
         return
     fi
-    local tmpdir out
+    local tmpdir out rc
     tmpdir="$(mktemp -d)"
-    out="$(cd "$tmpdir" && sh "$script" configure 2>/dev/null)"
+    if [ $? -ne 0 ] || [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
+        printf '  FAIL  %s — could not create sandbox tmpdir (mktemp -d failed)\n' "$label"
+        fail_count=$((fail_count + 1))
+        rm -rf "$tmpdir" 2>/dev/null
+        return
+    fi
+    if ! cd "$tmpdir"; then
+        printf '  FAIL  %s — could not cd into sandbox tmpdir: %s\n' "$label" "$tmpdir"
+        fail_count=$((fail_count + 1))
+        rm -rf "$tmpdir"
+        return
+    fi
+    out="$(sh "$script" configure 2>/dev/null)"
+    rc=$?
+    cd "$REPO_ROOT" || true
     rm -rf "$tmpdir"
+    if [ "$rc" -ne 0 ]; then
+        printf '  FAIL  %s — configure run exited non-zero (rc=%d)\n' "$label" "$rc"
+        fail_count=$((fail_count + 1))
+        return
+    fi
     if printf '%s\n' "$out" | grep -qE -e "$pattern"; then
         printf '  PASS  %s\n' "$label"
         pass_count=$((pass_count + 1))
@@ -255,10 +288,31 @@ assert_postinst_silent_on_nonconfigure() {
         fail_count=$((fail_count + 1))
         return
     fi
-    local tmpdir out
+    local tmpdir out rc
     tmpdir="$(mktemp -d)"
-    out="$(cd "$tmpdir" && sh "$script" abort-upgrade 2>/dev/null)"
+    if [ $? -ne 0 ] || [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
+        printf '  FAIL  %s — could not create sandbox tmpdir (mktemp -d failed)\n' "$label"
+        fail_count=$((fail_count + 1))
+        rm -rf "$tmpdir" 2>/dev/null
+        return
+    fi
+    if ! cd "$tmpdir"; then
+        printf '  FAIL  %s — could not cd into sandbox tmpdir: %s\n' "$label" "$tmpdir"
+        fail_count=$((fail_count + 1))
+        rm -rf "$tmpdir"
+        return
+    fi
+    out="$(sh "$script" abort-upgrade 2>/dev/null)"
+    rc=$?
+    cd "$REPO_ROOT" || true
     rm -rf "$tmpdir"
+    # Emptiness only counts as SILENT if the run actually reached and executed
+    # the script with rc=0 — a skipped/failed run must not read as pass.
+    if [ "$rc" -ne 0 ]; then
+        printf '  FAIL  %s — non-configure run exited non-zero (rc=%d)\n' "$label" "$rc"
+        fail_count=$((fail_count + 1))
+        return
+    fi
     if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
         printf '  PASS  %s\n' "$label"
         pass_count=$((pass_count + 1))
