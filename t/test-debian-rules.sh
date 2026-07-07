@@ -249,6 +249,19 @@ assert_postinst_emits_on_configure() {
         fail_count=$((fail_count + 1))
         return
     fi
+    # Self-protection: NEVER execute a postinst that would touch the host FS.
+    # The standalone assert_grep_absent guard above only *reports* a
+    # reintroduced host-touching op (it doesn't stop this helper from then
+    # running the real script). This pre-check makes the execute helper refuse
+    # to run such a script at all — so a future regression that puts an
+    # `ln -s`, `rm -f`, or `modules-enabled` op back into the postinst is caught
+    # AND never executed against the host. The pattern is deliberately narrow so
+    # it does not false-positive on the current print-only banner text.
+    if grep -qE 'ln -s|rm -f|modules-enabled' "$script"; then
+        printf '  FAIL  %s — refusing to execute postinst that contains host-touching ops\n' "$label"
+        fail_count=$((fail_count + 1))
+        return
+    fi
     local tmpdir out rc
     tmpdir="$(mktemp -d)"
     if [ $? -ne 0 ] || [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
@@ -285,6 +298,19 @@ assert_postinst_silent_on_nonconfigure() {
     local label="$2"
     if [ ! -f "$script" ]; then
         printf '  FAIL  %s — file missing: %s\n' "$label" "$script"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    # Self-protection: NEVER execute a postinst that would touch the host FS.
+    # The standalone assert_grep_absent guard above only *reports* a
+    # reintroduced host-touching op (it doesn't stop this helper from then
+    # running the real script). This pre-check makes the execute helper refuse
+    # to run such a script at all — so a future regression that puts an
+    # `ln -s`, `rm -f`, or `modules-enabled` op back into the postinst is caught
+    # AND never executed against the host. The pattern is deliberately narrow so
+    # it does not false-positive on the current print-only banner text.
+    if grep -qE 'ln -s|rm -f|modules-enabled' "$script"; then
+        printf '  FAIL  %s — refusing to execute postinst that contains host-touching ops\n' "$label"
         fail_count=$((fail_count + 1))
         return
     fi
