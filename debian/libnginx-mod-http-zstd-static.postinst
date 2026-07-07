@@ -1,26 +1,36 @@
 #!/bin/sh
-# postinst — enable the zstd static module by symlinking its load_module
-# snippet from /usr/share/nginx/modules-available/ into
-# /etc/nginx/modules-enabled/ on first `configure`. Mirrors the convention
-# used by Debian/Ubuntu's libnginx-mod-* packages (e.g. libnginx-mod-http-geoip):
-# nginx-common's stock config sources /etc/nginx/modules-enabled/*.conf, so the
-# symlink IS the enable mechanism. The 50- numeric prefix orders our module
-# alongside the stock libnginx-mod-* set (which all use 50-).
-#
-# Idempotent: `ln -sf` overwrites any existing symlink (including a stale
-# dangling one pointing at an old path), so a reinstall or `dpkg --configure -a`
-# re-run is harmless. A bare `[ -e link ]` guard would be unsafe here — it
-# returns false for dangling symlinks, after which `ln -s` fails under `set -e`
-# with "File exists". The matching postrm tears the symlink down on remove/purge.
+# postinst — the .deb ships the zstd static module .so plus a load_module
+# snippet under /usr/share/nginx/modules-available/, but does NOT auto-enable
+# it. These packages target nginx.org mainline, whose stock nginx.conf sources
+# only mime.types + conf.d/*.conf, so the Debian auto-enable symlink convention
+# would silently load nothing here. Instead, mirroring nginx.org's own
+# Makefile.module-brotli MODULE_POST convention, on first `configure` we print
+# a banner telling the operator to add the module's load_module line to
+# /etc/nginx/nginx.conf (main context) and reload nginx.
 
 set -e
 
-case "$1" in
-    configure)
-        ln -sf /usr/share/nginx/modules-available/mod-http-zstd-static.conf \
-               /etc/nginx/modules-enabled/50-mod-http-zstd-static.conf
-        ;;
-esac
+if [ "$1" != "configure" ]; then
+    exit 0
+fi
+
+cat <<'BANNER'
+----------------------------------------------------------------------
+
+The nginx zstd static module (ngx_http_zstd_static_module) is now
+installed, but not yet enabled.
+
+To enable it, add the following line to the main context of
+/etc/nginx/nginx.conf (NOT inside the http { } block):
+
+    load_module modules/ngx_http_zstd_static_module.so;
+
+Then reload nginx:
+
+    nginx -s reload
+
+----------------------------------------------------------------------
+BANNER
 
 #DEBHELPER#
 

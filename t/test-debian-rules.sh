@@ -46,34 +46,6 @@ assert_grep_present() {
     fi
 }
 
-# Same as assert_grep_present but joins shell line-continuations (`\<NL>`)
-# before matching. Needed for postinst/postrm scripts where the `ln -s`
-# invocation is wrapped across two lines for readability — grep is
-# line-oriented and would otherwise miss the joined pattern.
-assert_grep_present_joined() {
-    local file="$1"
-    local pattern="$2"
-    local label="$3"
-    if [ ! -f "$file" ]; then
-        printf '  FAIL  %s — file missing: %s\n' "$label" "$file"
-        fail_count=$((fail_count + 1))
-        return
-    fi
-    # awk joins every `\\\n` continuation into a single line, then we grep
-    # the flattened stream. Using awk (not sed) for portability — BSD sed
-    # on macOS rejects the multi-line `:a;N;$!ba;s/...` idiom that GNU sed
-    # accepts. macOS dev parity matters since contributors run host-side
-    # tests outside Docker.
-    if awk '/\\$/ { sub(/\\$/, ""); printf "%s", $0; next } { print }' "$file" \
-       | grep -qE -e "$pattern"; then
-        printf '  PASS  %s\n' "$label"
-        pass_count=$((pass_count + 1))
-    else
-        printf '  FAIL  %s — pattern not found (after joining \\-NL): %s\n' "$label" "$pattern"
-        fail_count=$((fail_count + 1))
-    fi
-}
-
 echo "=== debian/rules two-module configure contract ==="
 
 if [ ! -f "$RULES" ]; then
@@ -164,14 +136,15 @@ assert_grep_present "$RULES" \
     "debian/rules references ZSTD_LIB env override"
 
 echo
-echo "=== module auto-enable maintainer scripts ==="
+echo "=== module enable maintainer scripts ==="
 
-# Ubuntu/Debian's libnginx-mod-* convention: the .deb only ships the
-# load_module snippet to /usr/share/nginx/modules-available/; postinst
-# symlinks it into /etc/nginx/modules-enabled/50-<name>.conf to actually
-# enable the module on first `configure`, and postrm tears down the symlink
-# on remove/purge. Without these scripts a user gets installed-but-not-loaded
-# modules (silent failure mode). Both packages must ship the pair.
+# nginx.org-native enable convention: these .debs target nginx.org mainline,
+# whose stock nginx.conf sources only mime.types + conf.d/*.conf (never
+# modules-enabled), so a modules-enabled symlink would silently load nothing.
+# Instead, mirroring nginx.org's own Makefile.module-brotli MODULE_POST, each
+# postinst prints a banner on `configure` instructing the operator to add the
+# module's `load_module modules/...so;` line to /etc/nginx/nginx.conf and
+# reload. No postrm is needed — there is no symlink to tear down.
 assert_file_exists() {
     local file="$1"
     local label="$2"
@@ -185,32 +158,29 @@ assert_file_exists() {
 }
 
 assert_file_exists "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
-    "filter package ships postinst (enables module-enabled symlink)"
-assert_file_exists "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postrm" \
-    "filter package ships postrm (removes module-enabled symlink)"
+    "filter package ships postinst (prints load_module enable banner)"
 assert_file_exists "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
-    "static package ships postinst (enables module-enabled symlink)"
-assert_file_exists "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postrm" \
-    "static package ships postrm (removes module-enabled symlink)"
+    "static package ships postinst (prints load_module enable banner)"
 
-# postinst MUST symlink modules-available -> modules-enabled with 50- prefix
-# (matches stock libnginx-mod-* numbering). Catches regressions where someone
-# rewrites the script and drops the symlink step.
-assert_grep_present_joined "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
-    'ln -s.*modules-available/mod-http-zstd-filter\.conf.*modules-enabled/50-mod-http-zstd-filter\.conf' \
-    "filter postinst creates 50- prefixed modules-enabled symlink"
-assert_grep_present_joined "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
-    'ln -s.*modules-available/mod-http-zstd-static\.conf.*modules-enabled/50-mod-http-zstd-static\.conf' \
-    "static postinst creates 50- prefixed modules-enabled symlink"
+# postinst MUST print the exact load_module line the operator needs to add to
+# nginx.conf. Catches regressions where someone rewrites the script and drops
+# or mistypes the banner instruction.
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    'load_module modules/ngx_http_zstd_filter_module\.so' \
+    "filter postinst banner names load_module ngx_http_zstd_filter_module.so"
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    'load_module modules/ngx_http_zstd_static_module\.so' \
+    "static postinst banner names load_module ngx_http_zstd_static_module.so"
 
-# postrm MUST remove the symlink on remove|purge so a reinstall doesn't see
-# a dangling symlink (rm -f is idempotent — safe).
-assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postrm" \
-    'rm -f.*modules-enabled/50-mod-http-zstd-filter\.conf' \
-    "filter postrm removes modules-enabled symlink"
-assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postrm" \
-    'rm -f.*modules-enabled/50-mod-http-zstd-static\.conf' \
-    "static postrm removes modules-enabled symlink"
+# Negative regression guard: neither postinst may reintroduce the
+# modules-enabled symlink dance (dead on nginx.org mainline). Guards against a
+# future pkg-oss re-scaffold silently bringing back `ln -s .../modules-enabled`.
+assert_grep_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    'modules-enabled|ln -s' \
+    "filter postinst does NOT create a modules-enabled symlink"
+assert_grep_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    'modules-enabled|ln -s' \
+    "static postinst does NOT create a modules-enabled symlink"
 
 # .install files MUST reference the renamed mod-http-zstd-*.conf source path
 # (Ubuntu convention) — not the old libnginx-mod-* package-named variant.
