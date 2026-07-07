@@ -7,6 +7,6 @@ Standards-Version: 4.6.0
 
 Package: libnginx-mod-http-zstd-filter
 Architecture: any
-Depends: nginx (>= 1.29.0), nginx (<< 1.29.1), ${shlibs:Depends}, ${misc:Depends}
+Depends: nginx (>= 1.31.2), nginx (<< 1.31.3), ${shlibs:Depends}, ${misc:Depends}
 Description: Zstandard compression filter module for nginx
  On-the-fly Zstandard response compression filter.

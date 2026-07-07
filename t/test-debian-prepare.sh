@@ -11,8 +11,8 @@
 #
 # Fixtures live in t/fixtures/debian/:
 #   - control.in.fixture                — input with @NGINX_VERSION_*@ placeholders
-#   - expected-control-1.29.5.txt       — happy path (LOWER=1.29.5 UPPER=1.29.6)
-#   - expected-control-1.29.0.txt       — edge case (patch already .0)
+#   - expected-control-1.31.2.txt       — happy path (LOWER=1.31.2 UPPER=1.31.3)
+#   - expected-control-1.31.0.txt       — edge case (patch already .0)
 #
 # Run:   bash t/test-debian-prepare.sh
 # Exit:  0 = all assertions hold; 1 = any assertion failed; 2 = harness error
@@ -111,11 +111,11 @@ assert_rejects() {
 
 echo "=== debian/prepare.sh substitution ==="
 
-assert_substitution "1.29.5" "${FIX_DIR}/expected-control-1.29.5.txt" \
-    "happy path: 1.29.5 → LOWER=1.29.5 UPPER=1.29.6"
+assert_substitution "1.31.2" "${FIX_DIR}/expected-control-1.31.2.txt" \
+    "happy path: 1.31.2 → LOWER=1.31.2 UPPER=1.31.3"
 
-assert_substitution "1.29.0" "${FIX_DIR}/expected-control-1.29.0.txt" \
-    "edge: patch is already .0 (1.29.0 → LOWER=1.29.0 UPPER=1.29.1)"
+assert_substitution "1.31.0" "${FIX_DIR}/expected-control-1.31.0.txt" \
+    "edge: patch is already .0 (1.31.0 → LOWER=1.31.0 UPPER=1.31.1)"
 
 echo
 echo "=== debian/prepare.sh input validation ==="
@@ -136,12 +136,12 @@ echo "=== debian/prepare.sh patch-rollover edge ==="
 # T4: ensure patch=9 increments to patch=10 (string-vs-arithmetic trap).
 # Build expected control on the fly from the fixture so we don't need to
 # commit yet another expected-* file for a one-off math check.
-rollover_expected="${work_dir}/expected-control-1.29.9.txt"
-sed -e 's/@NGINX_VERSION_LOWER@/1.29.9/g' \
-    -e 's/@NGINX_VERSION_UPPER@/1.29.10/g' \
+rollover_expected="${work_dir}/expected-control-1.31.9.txt"
+sed -e 's/@NGINX_VERSION_LOWER@/1.31.9/g' \
+    -e 's/@NGINX_VERSION_UPPER@/1.31.10/g' \
     "$CONTROL_IN_FIXTURE" > "$rollover_expected"
-assert_substitution "1.29.9" "$rollover_expected" \
-    "patch=9 rollover (1.29.9 → LOWER=1.29.9 UPPER=1.29.10)"
+assert_substitution "1.31.9" "$rollover_expected" \
+    "patch=9 rollover (1.31.9 → LOWER=1.31.9 UPPER=1.31.10)"
 
 echo
 echo "=== debian/prepare.sh production control.in round-trip ==="
@@ -156,7 +156,7 @@ prod_dir="${work_dir}/prod"
 mkdir -p "${prod_dir}/debian"
 cp "${REPO_ROOT}/debian/control.in" "${prod_dir}/debian/control.in"
 prod_rc=0
-prod_out=$(cd "$prod_dir" && "$PREPARE_SCRIPT" "1.29.5" 2>&1) || prod_rc=$?
+prod_out=$(cd "$prod_dir" && "$PREPARE_SCRIPT" "1.31.2" 2>&1) || prod_rc=$?
 
 if [ "$prod_rc" -ne 0 ]; then
     printf '  FAIL  %s — exited %d\n         output: %s\n' "$prod_label" "$prod_rc" "$prod_out"
@@ -169,10 +169,10 @@ elif grep -q '@NGINX_VERSION_' "${prod_dir}/debian/control"; then
     grep '@NGINX_VERSION_' "${prod_dir}/debian/control" | sed 's/^/         /'
     fail_count=$((fail_count + 1))
 else
-    lower_hits=$(grep -c 'nginx (>= 1.29.5)' "${prod_dir}/debian/control" || true)
-    upper_hits=$(grep -c 'nginx (<< 1.29.6)' "${prod_dir}/debian/control" || true)
+    lower_hits=$(grep -c 'nginx (>= 1.31.2)' "${prod_dir}/debian/control" || true)
+    upper_hits=$(grep -c 'nginx (<< 1.31.3)' "${prod_dir}/debian/control" || true)
     if [ "$lower_hits" -eq 2 ] && [ "$upper_hits" -eq 2 ]; then
-        printf '  PASS  %s (both packages pin lower=1.29.5 upper=1.29.6)\n' "$prod_label"
+        printf '  PASS  %s (both packages pin lower=1.31.2 upper=1.31.3)\n' "$prod_label"
         pass_count=$((pass_count + 1))
     else
         printf '  FAIL  %s — expected 2 of each pin, got lower=%d upper=%d\n' \
