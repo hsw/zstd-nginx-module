@@ -7,6 +7,24 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
 
 ## [Unreleased]
 
+### Fixed
+
+- The Debian package now pins its nginx dependency patch-exact
+  (`nginx (>= x.y.z), nginx (<< x.y.z+1)`) instead of per-minor. nginx
+  refuses to load a dynamic module whose compiled-in version differs from
+  the running binary, so a routine `apt upgrade` within a minor (e.g.
+  1.29.5 → 1.29.6) could previously leave the module unloadable and
+  hard-fail the next reload — a production outage while apt reported all
+  deps satisfied. The tighter range holds nginx at the version the module
+  was built against instead.
+- Module packages no longer rely on the Debian `modules-enabled` symlink
+  layout, which nginx.org mainline — the sole target of these `.deb`s —
+  does not source from its `nginx.conf`, so the auto-created symlink
+  silently loaded nothing. Each postinst now prints an nginx.org-style
+  banner instructing the operator to add the `load_module modules/...so;`
+  line to `/etc/nginx/nginx.conf` and reload. The now-obsolete `*.postrm`
+  scripts (which only tore the symlink down) were removed.
+
 ## [0.4.0] - 2026-06-12
 
 ### Changed
