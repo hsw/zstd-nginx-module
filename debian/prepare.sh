@@ -3,7 +3,7 @@
 # debian/control.in to produce debian/control.
 #
 # Usage: debian/prepare.sh <nginx_version>
-#   nginx_version  e.g. "1.29.5"
+#   nginx_version  e.g. "1.31.2"
 #
 # Substitution rule (patch-exact ABI pin):
 #   NGINX_VERSION_LOWER = <major>.<minor>.<patch>     (exact build version)
@@ -18,7 +18,7 @@ set -euo pipefail
 usage() {
     cat >&2 <<'EOF'
 Usage: debian/prepare.sh <nginx_version>
-  nginx_version  e.g. "1.29.5"
+  nginx_version  e.g. "1.31.2"
 
 Reads  debian/control.in and writes debian/control with the
 @NGINX_VERSION_LOWER@ / @NGINX_VERSION_UPPER@ placeholders substituted

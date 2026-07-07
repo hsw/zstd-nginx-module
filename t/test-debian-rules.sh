@@ -182,16 +182,113 @@ assert_grep_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
     'modules-enabled|ln -s' \
     "static postinst does NOT create a modules-enabled symlink"
 
+# Each postinst MUST keep the `configure` guard and the `#DEBHELPER#` token.
+# The guard is the standard Debian maintainer-script arm (mirrors nginx.org's
+# own nginx-module.postinst.in); #DEBHELPER# is where dh injects trigger code.
+# A re-scaffold dropping either would silently change install behaviour, so
+# assert both statically.
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    '"\$1" != "configure"' \
+    "filter postinst keeps the configure guard"
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    '"\$1" != "configure"' \
+    "static postinst keeps the configure guard"
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    '#DEBHELPER#' \
+    "filter postinst keeps the #DEBHELPER# token"
+assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    '#DEBHELPER#' \
+    "static postinst keeps the #DEBHELPER# token"
+
+# The old symlink-teardown *.postrm scripts were removed (no symlink to tear
+# down). Guard against a pkg-oss re-scaffold reintroducing them.
+assert_file_absent() {
+    local file="$1"
+    local label="$2"
+    if [ ! -e "$file" ]; then
+        printf '  PASS  %s\n' "$label"
+        pass_count=$((pass_count + 1))
+    else
+        printf '  FAIL  %s — unexpectedly present: %s\n' "$label" "$file"
+        fail_count=$((fail_count + 1))
+    fi
+}
+assert_file_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postrm" \
+    "filter package ships NO postrm (no symlink to tear down)"
+assert_file_absent "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postrm" \
+    "static package ships NO postrm (no symlink to tear down)"
+
+# Belt-and-suspenders on top of the static banner greps above: a static grep
+# cannot catch an EMISSION regression — an inverted guard
+# (`if [ "$1" = "configure" ]; then exit 0; fi`) or a heredoc-terminator typo
+# keeps the load_module line in the FILE while the operator sees nothing on
+# install. So EXECUTE each postinst in a throwaway sandbox and assert what
+# actually reaches stdout: the banner on `configure`, and NOTHING on a
+# non-configure arg. (The literal `#DEBHELPER#` line is a `#`-comment under
+# `sh`, so running the script directly is harmless.)
+assert_postinst_emits_on_configure() {
+    local script="$1"
+    local pattern="$2"
+    local label="$3"
+    if [ ! -f "$script" ]; then
+        printf '  FAIL  %s — file missing: %s\n' "$label" "$script"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    local tmpdir out
+    tmpdir="$(mktemp -d)"
+    out="$(cd "$tmpdir" && sh "$script" configure 2>/dev/null)"
+    rm -rf "$tmpdir"
+    if printf '%s\n' "$out" | grep -qE -e "$pattern"; then
+        printf '  PASS  %s\n' "$label"
+        pass_count=$((pass_count + 1))
+    else
+        printf '  FAIL  %s — configure run did not emit: %s\n' "$label" "$pattern"
+        fail_count=$((fail_count + 1))
+    fi
+}
+assert_postinst_silent_on_nonconfigure() {
+    local script="$1"
+    local label="$2"
+    if [ ! -f "$script" ]; then
+        printf '  FAIL  %s — file missing: %s\n' "$label" "$script"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+    local tmpdir out
+    tmpdir="$(mktemp -d)"
+    out="$(cd "$tmpdir" && sh "$script" abort-upgrade 2>/dev/null)"
+    rm -rf "$tmpdir"
+    if [ -z "$(printf '%s' "$out" | tr -d '[:space:]')" ]; then
+        printf '  PASS  %s\n' "$label"
+        pass_count=$((pass_count + 1))
+    else
+        printf '  FAIL  %s — non-configure run unexpectedly printed output: %s\n' "$label" "$out"
+        fail_count=$((fail_count + 1))
+    fi
+}
+assert_postinst_emits_on_configure "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    'load_module modules/ngx_http_zstd_filter_module\.so' \
+    "filter postinst EMITS the load_module banner when run \`configure\`"
+assert_postinst_emits_on_configure "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    'load_module modules/ngx_http_zstd_static_module\.so' \
+    "static postinst EMITS the load_module banner when run \`configure\`"
+assert_postinst_silent_on_nonconfigure "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.postinst" \
+    "filter postinst is SILENT when run with a non-configure arg"
+assert_postinst_silent_on_nonconfigure "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.postinst" \
+    "static postinst is SILENT when run with a non-configure arg"
+
 # .install files MUST reference the renamed mod-http-zstd-*.conf source path
 # (Ubuntu convention) — not the old libnginx-mod-* package-named variant.
-# The postinst symlink target is mod-http-zstd-*.conf, so the .install line
-# determines what actually lands at /usr/share/nginx/modules-available/.
+# This ships a copy-paste reference .conf carrying the load_module line to
+# /usr/share/nginx/modules-available/, so an operator can copy it verbatim
+# rather than retype the line the postinst banner prints.
 assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-filter.install" \
     '^debian/mod-http-zstd-filter\.conf usr/share/nginx/modules-available/' \
-    "filter .install ships mod-http-zstd-filter.conf (matches postinst symlink target)"
+    "filter .install ships mod-http-zstd-filter.conf reference conf"
 assert_grep_present "${DEBIAN_DIR}/libnginx-mod-http-zstd-static.install" \
     '^debian/mod-http-zstd-static\.conf usr/share/nginx/modules-available/' \
-    "static .install ships mod-http-zstd-static.conf (matches postinst symlink target)"
+    "static .install ships mod-http-zstd-static.conf reference conf"
 
 echo
 echo "=== summary ==="

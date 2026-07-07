@@ -13,7 +13,7 @@ This fork diverges from upstream [tokers/zstd-nginx-module](https://github.com/t
   (`nginx (>= x.y.z), nginx (<< x.y.z+1)`) instead of per-minor. nginx
   refuses to load a dynamic module whose compiled-in version differs from
   the running binary, so a routine `apt upgrade` within a minor (e.g.
-  1.29.5 → 1.29.6) could previously leave the module unloadable and
+  1.31.2 → 1.31.3) could previously leave the module unloadable and
   hard-fail the next reload — a production outage while apt reported all
   deps satisfied. The tighter range holds nginx at the version the module
   was built against instead.
